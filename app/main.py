@@ -1,11 +1,10 @@
-import asyncio, json, logging
+import asyncio, contextlib, json, logging
 from contextlib import asynccontextmanager
 
 import aio_pika
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pymongo import AsyncMongoClient
-from pymongo.errors import DuplicateKeyError
+from pymongo import AsyncMongoClient, ReplaceOne
 
 log = logging.getLogger("ingest")
 logging.basicConfig(level=logging.INFO)
@@ -23,26 +22,46 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
-async def handle(message, col):
+def parse_items(body: bytes) -> list[dict]:
+    """Accept one cow object, a list of cow objects, or double-encoded JSON."""
+    payload = json.loads(body)
+    if isinstance(payload, str):  # JSON that was stringified twice
+        payload = json.loads(payload)
+    items = payload if isinstance(payload, list) else [payload]
+    out = []
+    for d in items:
+        if not isinstance(d, dict) or "cow_id" not in d or "date" not in d:
+            raise TypeError("every item must be an object with cow_id and date")
+        d = dict(d)
+        d["cow_id"] = str(d["cow_id"]).strip().upper()
+        d["date"] = str(d["date"]).strip()
+        d["_id"] = f'{d["cow_id"]}-{d["date"]}'  # one document per cow per day
+        out.append(d)
+    return out
+
+
+async def handle(message: aio_pika.abc.AbstractIncomingMessage, col):
     try:
-        doc = json.loads(message.body)
-        if not isinstance(doc, dict):
-            raise TypeError("payload is not a JSON object")
-        if "cow_id" in doc:
-            doc["cow_id"] = str(doc["cow_id"]).strip().upper()
-            if "date" in doc:
-                doc["_id"] = f'{doc["cow_id"]}-{doc["date"]}'   # no duplicates
-        await col.insert_one(doc)
+        items = parse_items(message.body)
+        if items:
+            ops = [ReplaceOne({"_id": d["_id"]}, d, upsert=True) for d in items]
+            await col.bulk_write(ops, ordered=False)
+            log.info("Stored %d document(s): %s", len(items), items[0]["_id"])
         await message.ack()
-    except DuplicateKeyError:
-        await message.ack()
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError):  # JSONDecodeError and UnicodeDecodeError are ValueErrors
         log.warning("Bad message dropped: %r", message.body[:200])
         await message.reject(requeue=False)
     except Exception:
         log.exception("DB error, requeueing")
         await asyncio.sleep(2)
         await message.nack(requeue=True)
+
+
+async def ensure_index(col):
+    try:
+        await col.create_index([("cow_id", 1), ("date", -1)])
+    except Exception:
+        log.exception("Could not create index (will continue)")
 
 
 async def consume(col):
@@ -71,13 +90,13 @@ async def lifespan(app: FastAPI):
     client = AsyncMongoClient(settings.mongo_uri)
     col = client[settings.mongo_db][settings.mongo_collection]
     app.state.col = col
-    try:
-        await col.create_index([("cow_id", 1), ("date", 1)])
-    except Exception:
-        log.exception("Could not create index (will continue)")
-    task = asyncio.create_task(consume(col))
+    tasks = [asyncio.create_task(consume(col)), asyncio.create_task(ensure_index(col))]
     yield
-    task.cancel()
+    for t in tasks:
+        t.cancel()
+    for t in tasks:
+        with contextlib.suppress(asyncio.CancelledError):
+            await t
     await client.close()
 
 
@@ -90,7 +109,7 @@ async def health():
 
 
 @app.get("/events/{cow_id}")
-async def events(cow_id: str, request: Request, limit: int = 30):
+async def events(cow_id: str, request: Request, limit: int = Query(30, ge=1, le=500)):
     cur = request.app.state.col.find(
         {"cow_id": cow_id.strip().upper()}, {"_id": 0}
     ).sort("date", -1).limit(limit)
