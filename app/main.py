@@ -22,7 +22,9 @@ class Settings(BaseSettings):
     queue_name: str = "test_queue"
     # Flask AI service on the Raspberry Pi, reached over Tailscale.
     # e.g. PI_AI_URL=http://100.109.169.109:8001
-    pi_ai_url: str = ""
+    # Default = the local socat forward started by start.sh (127.0.0.1:8001 -> Pi).
+    # The PI_AI_URL environment variable overrides it when set.
+    pi_ai_url: str = "http://127.0.0.1:8001"
     # Only if outgoing Tailscale traffic on this host needs a proxy,
     # e.g. PI_PROXY=socks5://localhost:1055  (requires: pip install "httpx[socks]")
     pi_proxy: str = ""
@@ -30,6 +32,7 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+log.info("AI service URL: %r (proxy: %r)", settings.pi_ai_url, settings.pi_proxy)
 
 
 # --------------------------------------------------------------------------
