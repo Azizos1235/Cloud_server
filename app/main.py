@@ -2,6 +2,7 @@ import asyncio, contextlib, json, logging
 from contextlib import asynccontextmanager
 
 import aio_pika
+import httpx
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
@@ -19,6 +20,13 @@ class Settings(BaseSettings):
     mongo_db: str = "farm"
     mongo_collection: str = "feeding_events"
     queue_name: str = "test_queue"
+    # Flask AI service on the Raspberry Pi, reached over Tailscale.
+    # e.g. PI_AI_URL=http://100.109.169.109:8001
+    pi_ai_url: str = ""
+    # Only if outgoing Tailscale traffic on this host needs a proxy,
+    # e.g. PI_PROXY=socks5://localhost:1055  (requires: pip install "httpx[socks]")
+    pi_proxy: str = ""
+    pi_ai_timeout: float = 30.0
 
 
 settings = Settings()
@@ -62,9 +70,23 @@ async def latest(col, cow_id: str):
 
 
 async def predict(record: dict) -> dict:
-    """Plug your AI model here. Return {...record, "model": {...}} (the shape
-    AiResult.fromResponse expects in the Flutter app)."""
-    raise NotImplementedError("No prediction model is wired into this server yet")
+    """Ask the Flask model service running on the Pi.
+
+    The Pi service reads the cow's history from MongoDB itself and returns
+    {...record, "model": {...}}, which is the shape AiResult.fromResponse
+    expects in the Flutter app.
+    """
+    if not settings.pi_ai_url:
+        raise NotImplementedError("PI_AI_URL is not set on the server")
+    url = f'{settings.pi_ai_url.rstrip("/")}/predict/{record["cow_id"]}'
+    async with httpx.AsyncClient(
+        timeout=settings.pi_ai_timeout,
+        proxy=settings.pi_proxy or None,
+    ) as client:
+        r = await client.get(url)
+    if r.status_code != 200:
+        raise RuntimeError(f"AI service HTTP {r.status_code}: {r.text[:200]}")
+    return r.json()
 
 
 # --------------------------------------------------------------------------
@@ -163,7 +185,7 @@ app = FastAPI(lifespan=lifespan)
 # --------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "pi_ai_configured": bool(settings.pi_ai_url)}
 
 
 @app.get("/events/{cow_id}")
@@ -174,7 +196,7 @@ async def events(cow_id: str, request: Request, limit: int = Query(30, ge=1, le=
     return await cur.to_list(length=limit)
 
 
-# These three are what HttpCowService calls (they were missing -> HTTP 404)
+# These three are what the Flutter CowService calls
 @app.get("/cows")
 async def cows(request: Request):
     return {"cows": sorted(await request.app.state.col.distinct("cow_id"))}
@@ -197,10 +219,16 @@ async def predict_http(cow_id: str, request: Request):
         return await predict(doc)
     except NotImplementedError as e:
         return JSONResponse({"error": str(e)}, status_code=501)
+    except Exception as e:
+        log.exception("AI service call failed")
+        return JSONResponse(
+            {"error": f"AI service unreachable: {type(e).__name__}: {e}"},
+            status_code=502,
+        )
 
 
 # --------------------------------------------------------------------------
-# WebSocket endpoint used by the Flutter CowService
+# WebSocket endpoint (optional live updates for the Flutter app)
 # --------------------------------------------------------------------------
 async def on_client_message(ws: WebSocket, col, msg: dict):
     kind = msg.get("type")
