@@ -22,6 +22,11 @@ done
 # local 127.0.0.1:5672 -> Pi's RabbitMQ through Tailscale
 socat TCP-LISTEN:5672,fork,reuseaddr,bind=127.0.0.1 \
   EXEC:"tailscale --socket=$SOCK nc $PI_HOST 5672" &
+
+# local 127.0.0.1:8001 -> Pi's Flask AI service through Tailscale
+# (Render env var: PI_AI_URL=http://127.0.0.1:8001)
+socat TCP-LISTEN:8001,fork,reuseaddr,bind=127.0.0.1 \
+  EXEC:"tailscale --socket=$SOCK nc $PI_HOST 8001" &
 sleep 2
 
 exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-10000}"
