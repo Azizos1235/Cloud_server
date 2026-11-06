@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     # new collections
     mongo_realtime_collection: str = "realtime_readings"   # every ESP32 message, append only
     mongo_daily_collection: str = "daily_consumption"      # one document per cow per day
-    mongo_profiles_collection: str = "test_cow_profiles"   # test collection: one profile per cow
+    mongo_profiles_collection: str = "cow_profiles"        # one profile per cow
     queue_name: str = "test_queue"
     # Flask AI service on the Raspberry Pi, reached over Tailscale.
     # e.g. PI_AI_URL=http://100.109.169.109:8001
