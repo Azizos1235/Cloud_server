@@ -1,4 +1,4 @@
-import asyncio, contextlib, json, logging
+import asyncio, contextlib, json, logging, math
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Literal
@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pymongo import AsyncMongoClient, InsertOne, ReplaceOne, UpdateOne
+from pymongo.errors import DuplicateKeyError
 
 log = logging.getLogger("ingest")
 logging.basicConfig(level=logging.INFO)
@@ -21,20 +22,18 @@ class Settings(BaseSettings):
     amqp_url: str
     mongo_uri: str
     mongo_db: str = "farm"
-    # existing collection: latest record per cow per day (the Pi AI service reads it)
+    # latest record per cow per day (the classifier service reads it)
     mongo_collection: str = "feeding_events"
-    # new collections
     mongo_realtime_collection: str = "realtime_readings"   # every ESP32 message, append only
     mongo_daily_collection: str = "daily_consumption"      # one document per cow per day
-    mongo_profiles_collection: str = "cow_profiles"        # one profile per cow
+    mongo_profiles_collection: str = "cow_profiles"        # one profile per cow (regression service reads it)
+    mongo_dispatch_collection: str = "feed_dispatch"       # one dispense per cow per day (regression service reads it)
     queue_name: str = "test_queue"
-    # Flask AI service on the Raspberry Pi, reached over Tailscale.
-    # e.g. PI_AI_URL=http://100.109.169.109:8001
-    # Default = the local socat forward started by start.sh (127.0.0.1:8001 -> Pi).
-    # The PI_AI_URL environment variable overrides it when set.
+    # Optional second queue with dispense confirmations from the ESP32.
+    # Empty = disabled. The queue must already exist (it is checked, not created).
+    dispatch_queue: str = ""
+    # Classifier service on the Raspberry Pi, reached over Tailscale.
     pi_ai_url: str = "http://127.0.0.1:8001"
-    # Only if outgoing Tailscale traffic on this host needs a proxy,
-    # e.g. PI_PROXY=socks5://localhost:1055  (requires: pip install "httpx[socks]")
     pi_proxy: str = ""
     pi_ai_timeout: float = 30.0
     # Delete raw real-time readings after this many days (0 = keep forever)
@@ -56,6 +55,7 @@ class Cols:
         self.realtime = db[settings.mongo_realtime_collection]
         self.daily = db[settings.mongo_daily_collection]
         self.profiles = db[settings.mongo_profiles_collection]
+        self.dispatch = db[settings.mongo_dispatch_collection]
 
 
 # --------------------------------------------------------------------------
@@ -96,9 +96,9 @@ async def latest(col, cow_id: str):
 
 
 async def predict(record: dict) -> dict:
-    """Ask the Flask model service running on the Pi.
+    """Ask the classifier service running on the Pi.
 
-    The Pi service reads the cow's history from MongoDB itself and returns
+    It reads the cow's history from MongoDB itself and returns
     {...record, "model": {...}}, which is the shape AiResult.fromResponse
     expects in the Flutter app.
     """
@@ -124,16 +124,19 @@ def num(v) -> float:
 
 
 # --------------------------------------------------------------------------
-# RabbitMQ -> MongoDB ingestion
+# RabbitMQ -> MongoDB ingestion: sensor readings (settings.queue_name)
 # --------------------------------------------------------------------------
-def parse_items(body: bytes) -> list[dict]:
-    """Accept one cow object, a list of cow objects, or double-encoded JSON."""
+def load_payload(body: bytes) -> list:
+    """Accept one object, a list of objects, or double-encoded JSON."""
     payload = json.loads(body)
     if isinstance(payload, str):  # JSON that was stringified twice
         payload = json.loads(payload)
-    items = payload if isinstance(payload, list) else [payload]
+    return payload if isinstance(payload, list) else [payload]
+
+
+def parse_items(body: bytes) -> list[dict]:
     out = []
-    for d in items:
+    for d in load_payload(body):
         if not isinstance(d, dict) or "cow_id" not in d or "date" not in d:
             raise TypeError("every item must be an object with cow_id and date")
         d = dict(d)
@@ -150,7 +153,7 @@ async def handle(message: aio_pika.abc.AbstractIncomingMessage, cols: Cols):
         if items:
             now = datetime.now(timezone.utc)
 
-            # 1) latest record per cow per day (the Pi AI service reads this)
+            # 1) latest record per cow per day (the classifier service reads this)
             await cols.events.bulk_write(
                 [ReplaceOne({"_id": d["_id"]}, d, upsert=True) for d in items],
                 ordered=False)
@@ -194,6 +197,48 @@ async def handle(message: aio_pika.abc.AbstractIncomingMessage, cols: Cols):
         await hub.broadcast({"type": "update", "cow_id": d["cow_id"], "data": data})
 
 
+# --------------------------------------------------------------------------
+# RabbitMQ -> MongoDB ingestion: dispense confirmations (settings.dispatch_queue)
+# --------------------------------------------------------------------------
+def parse_dispatch(body: bytes) -> list[dict]:
+    out = []
+    for p in load_payload(body):
+        if not isinstance(p, dict) or "cow_id" not in p or "food_g" not in p:
+            raise TypeError("every item must be an object with cow_id and food_g")
+        cid = str(p["cow_id"]).strip().upper()
+        if not cid:
+            raise ValueError("cow_id is empty")
+        date = str(p.get("date") or datetime.now().strftime("%Y-%m-%d")).strip()[:10]
+        datetime.strptime(date, "%Y-%m-%d")          # raises if invalid
+        food = float(p["food_g"])
+        if not math.isfinite(food) or food < 0:
+            raise ValueError("food_g must be a finite number >= 0")
+        out.append({"_id": f"{cid}-{date}",           # one dispense per cow per day
+                    "cow_id": cid, "date": date, "food_g": round(food),
+                    "served_at": str(p.get("served_at")
+                                     or datetime.now().isoformat(timespec="seconds"))})
+    return out
+
+
+async def handle_dispatch(message: aio_pika.abc.AbstractIncomingMessage, cols: Cols):
+    try:
+        docs = parse_dispatch(message.body)
+        for d in docs:
+            try:
+                await cols.dispatch.insert_one(d)
+                log.info("Dispatch stored: %s", d["_id"])
+            except DuplicateKeyError:                 # first one wins
+                log.info("Dispatch already recorded, ignored: %s", d["_id"])
+        await message.ack()
+    except (ValueError, TypeError):
+        log.warning("Bad dispatch message dropped: %r", message.body[:200])
+        await message.reject(requeue=False)
+    except Exception:
+        log.exception("DB error on dispatch, requeueing")
+        await asyncio.sleep(2)
+        await message.nack(requeue=True)
+
+
 async def ensure_index(cols: Cols):
     try:
         await cols.events.create_index([("cow_id", 1), ("date", -1)])
@@ -205,27 +250,45 @@ async def ensure_index(cols: Cols):
         await cols.daily.create_index([("cow_id", 1), ("date", -1)])
     except Exception:
         log.exception("Could not create indexes (will continue)")
+    try:
+        # one feeding per cow per day, enforced by the database
+        await cols.dispatch.create_index([("cow_id", 1), ("date", 1)], unique=True)
+    except Exception:
+        log.exception("Could not create the feed_dispatch unique index (will continue)")
+
+
+async def pump(connection, queue_name: str, handler, cols: Cols):
+    channel = await connection.channel()
+    await channel.set_qos(prefetch_count=20)
+    # passive: only checks the existing queue, never changes it
+    queue = await channel.declare_queue(queue_name, passive=True)
+    log.info("Consuming from %s", queue_name)
+    async with queue.iterator() as it:
+        async for message in it:
+            await handler(message, cols)
 
 
 async def consume(cols: Cols):
     # Keep retrying: the Tailscale tunnel may need a few seconds, and the Pi may be offline
     while True:
+        tasks = []
         try:
             connection = await aio_pika.connect_robust(settings.amqp_url)
             async with connection:
-                channel = await connection.channel()
-                await channel.set_qos(prefetch_count=20)
-                # passive: only checks the existing queue, never changes it
-                queue = await channel.declare_queue(settings.queue_name, passive=True)
-                log.info("Consuming from %s", settings.queue_name)
-                async with queue.iterator() as it:
-                    async for message in it:
-                        await handle(message, cols)
+                tasks = [asyncio.create_task(pump(connection, settings.queue_name, handle, cols))]
+                if settings.dispatch_queue:
+                    tasks.append(asyncio.create_task(
+                        pump(connection, settings.dispatch_queue, handle_dispatch, cols)))
+                await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("AMQP connection failed, retrying in 5 s")
             await asyncio.sleep(5)
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @asynccontextmanager
@@ -252,7 +315,8 @@ app = FastAPI(lifespan=lifespan)
 # --------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "pi_ai_configured": bool(settings.pi_ai_url)}
+    return {"status": "ok", "pi_ai_configured": bool(settings.pi_ai_url),
+            "dispatch_queue": settings.dispatch_queue or None}
 
 
 @app.get("/events/{cow_id}")
@@ -295,7 +359,7 @@ async def predict_http(cow_id: str, request: Request):
 
 
 # --------------------------------------------------------------------------
-# Real-time readings and daily consumption
+# Real-time readings, daily consumption, dispatches
 # --------------------------------------------------------------------------
 @app.get("/realtime/{cow_id}")
 async def realtime(cow_id: str, request: Request, limit: int = Query(50, ge=1, le=1000)):
@@ -313,8 +377,16 @@ async def daily(cow_id: str, request: Request, limit: int = Query(30, ge=1, le=3
     return await cur.to_list(length=limit)
 
 
+@app.get("/dispatch/{cow_id}")
+async def dispatches(cow_id: str, request: Request, limit: int = Query(30, ge=1, le=366)):
+    cur = request.app.state.cols.dispatch.find(
+        {"cow_id": cow_id.strip().upper()}, {"_id": 0}
+    ).sort("date", -1).limit(limit)
+    return await cur.to_list(length=limit)
+
+
 # --------------------------------------------------------------------------
-# Cow profiles (test collection)
+# Cow profiles
 # --------------------------------------------------------------------------
 class CowProfile(BaseModel):
     # same limits as the regression service, so it never rejects a stored profile
