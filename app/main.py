@@ -10,7 +10,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pymongo import AsyncMongoClient, InsertOne, ReplaceOne, UpdateOne
+from pymongo import AsyncMongoClient, ReplaceOne, UpdateOne
 from pymongo.errors import DuplicateKeyError
 
 log = logging.getLogger("ingest")
@@ -28,8 +28,11 @@ class Settings(BaseSettings):
     mongo_daily_collection: str = "daily_consumption"      # one document per cow per day
     mongo_profiles_collection: str = "cow_profiles"        # one profile per cow (regression service reads it)
     mongo_dispatch_collection: str = "feed_dispatch"       # one dispense per cow per day (regression service reads it)
-    queue_name: str = "test_queue"
-    # Optional second queue with dispense confirmations from the ESP32.
+    # RabbitMQ queues. This service only reads them: they must already exist
+    # (they are checked, not created) and the AMQP_URL user needs read access.
+    daily_queue: str = "cow.daily"        # the day's running record, one message per ESP32 post
+    realtime_queue: str = "cow.realtime"  # live readings: logged, then pushed to the apps
+    # Optional queue with dispense confirmations from the ESP32.
     # Empty = disabled. The queue must already exist (it is checked, not created).
     dispatch_queue: str = ""
     # Classifier service on the Raspberry Pi, reached over Tailscale.
@@ -48,7 +51,14 @@ BREED_TYPE = {"Holstein": "dairy", "Jersey": "dairy", "Angus": "beef",
 
 
 class Cols:
-    """All MongoDB collections used by the service."""
+    """All MongoDB collections used by the service. One role per collection:
+
+    events    feeding_events     latest full record per cow per day  (classifier service reads it)
+    daily     daily_consumption  running totals + appetite class per cow per day
+    realtime  realtime_readings  append-only log of live readings, deleted after N days
+    profiles  cow_profiles       one static profile per cow          (regression service reads it)
+    dispatch  feed_dispatch      one dispense per cow per day        (regression service reads it)
+    """
 
     def __init__(self, db):
         self.events = db[settings.mongo_collection]
@@ -124,7 +134,7 @@ def num(v) -> float:
 
 
 # --------------------------------------------------------------------------
-# RabbitMQ -> MongoDB ingestion: sensor readings (settings.queue_name)
+# RabbitMQ -> MongoDB ingestion: sensor readings (daily_queue and realtime_queue)
 # --------------------------------------------------------------------------
 def load_payload(body: bytes) -> list:
     """Accept one object, a list of objects, or double-encoded JSON."""
@@ -141,60 +151,109 @@ def parse_items(body: bytes) -> list[dict]:
             raise TypeError("every item must be an object with cow_id and date")
         d = dict(d)
         d["cow_id"] = str(d["cow_id"]).strip().upper()
-        d["date"] = str(d["date"]).strip()
+        if not d["cow_id"]:
+            raise ValueError("cow_id is empty")
+        d["date"] = str(d["date"]).strip()[:10]
+        datetime.strptime(d["date"], "%Y-%m-%d")        # ValueError if it is not YYYY-MM-DD
         d["_id"] = f'{d["cow_id"]}-{d["date"]}'  # one document per cow per day
         out.append(d)
     return out
 
 
-async def handle(message: aio_pika.abc.AbstractIncomingMessage, cols: Cols):
+def parse_ts(value, default: datetime) -> datetime:
+    """ISO-8601 string (the 'received_at' Node-RED adds) -> aware UTC datetime."""
+    if isinstance(value, str):
+        try:
+            t = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return default
+        return t.astimezone(timezone.utc) if t.tzinfo else t.replace(tzinfo=timezone.utc)
+    return default
+
+
+def daily_update(d: dict, now: datetime) -> UpdateOne:
+    """Running totals for one cow and day.
+
+    The ESP32 sends running totals, so $max keeps the highest value: a retried
+    or out-of-order message can never double count or lower a total.
+    """
+    update = {
+        "$setOnInsert": {"cow_id": d["cow_id"], "date": d["date"], "first_reading_at": now},
+        "$max": {"total_food_consumed_g": num(d.get("food_consumed_g")),
+                 "total_feed_offered_g": num(d.get("feed_offered_g")),
+                 "visits": num(d.get("visits")),
+                 "total_eating_minutes": num(d.get("eating_minutes"))},
+        "$set": {"last_updated": now},
+    }
+    appetite = d.get("appetite_class")             # stored when the sender provides it
+    if isinstance(appetite, str) and appetite.strip():
+        update["$set"]["appetite_class"] = appetite.strip()
+    return UpdateOne({"_id": d["_id"]}, update, upsert=True)
+
+
+async def handle_daily(message: aio_pika.abc.AbstractIncomingMessage, cols: Cols):
+    """cow.daily: the day's record of a cow (running totals)."""
     try:
         items = parse_items(message.body)
         if items:
             now = datetime.now(timezone.utc)
 
-            # 1) latest record per cow per day (the classifier service reads this)
+            # 1) latest full record per cow per day (the classifier service reads this)
             await cols.events.bulk_write(
                 [ReplaceOne({"_id": d["_id"]}, d, upsert=True) for d in items],
                 ordered=False)
 
-            # 2) raw real-time log: every message is appended, never overwritten
-            await cols.realtime.bulk_write(
-                [InsertOne({**{k: v for k, v in d.items() if k != "_id"},
-                            "received_at": now}) for d in items],
-                ordered=False)
+            # 2) running totals per cow per day
+            await cols.daily.bulk_write([daily_update(d, now) for d in items], ordered=False)
 
-            # 3) daily totals. The ESP32 sends running totals for the day, so
-            #    $max keeps the highest value: a retried or out-of-order message
-            #    can never double count or lower the total.
-            await cols.daily.bulk_write([
-                UpdateOne(
-                    {"_id": d["_id"]},
-                    {"$setOnInsert": {"cow_id": d["cow_id"], "date": d["date"],
-                                      "first_reading_at": now},
-                     "$max": {"total_food_consumed_g": num(d.get("food_consumed_g")),
-                              "total_feed_offered_g": num(d.get("feed_offered_g")),
-                              "visits": num(d.get("visits")),
-                              "total_eating_minutes": num(d.get("eating_minutes"))},
-                     "$set": {"last_updated": now}},
-                    upsert=True) for d in items], ordered=False)
-
-            log.info("Stored %d document(s): %s", len(items), items[0]["_id"])
+            log.info("Daily: stored %d record(s), e.g. %s", len(items), items[0]["_id"])
         await message.ack()
     except (ValueError, TypeError):  # JSONDecodeError and UnicodeDecodeError are ValueErrors
-        log.warning("Bad message dropped: %r", message.body[:200])
+        log.warning("Bad daily message dropped: %r", message.body[:200])
+        await message.reject(requeue=False)
+    except Exception:
+        log.exception("DB error on daily message, requeueing")
+        await asyncio.sleep(2)
+        await message.nack(requeue=True)
+
+
+async def handle_realtime(message: aio_pika.abc.AbstractIncomingMessage, cols: Cols):
+    """cow.realtime: live readings. Logged, then pushed to every connected app.
+
+    This queue is lossy by design (short TTL, not persistent); cow.daily is the
+    authoritative record.
+    """
+    try:
+        items = parse_items(message.body)
+        if items:
+            now = datetime.now(timezone.utc)
+            ops = []
+            for d in items:
+                ts = parse_ts(d.get("received_at"), now)
+                doc = {k: v for k, v in d.items() if k != "_id"}
+                doc["received_at"] = ts        # when the gateway got the reading (event time)
+                doc["stored_at"] = now         # when this service wrote it
+                # the same reading delivered twice gets the same _id, so it is stored once
+                key = f'{d["cow_id"]}|{ts.isoformat(timespec="milliseconds")}'
+                ops.append(UpdateOne({"_id": key}, {"$setOnInsert": doc}, upsert=True))
+            await cols.realtime.bulk_write(ops, ordered=False)
+            log.info("Realtime: logged %d reading(s) for %s", len(items), items[0]["cow_id"])
+        await message.ack()
+    except (ValueError, TypeError):
+        log.warning("Bad realtime message dropped: %r", message.body[:200])
         await message.reject(requeue=False)
         return
     except Exception:
-        log.exception("DB error, requeueing")
+        log.exception("DB error on realtime message, requeueing")
         await asyncio.sleep(2)
         await message.nack(requeue=True)
         return
 
-    # push the new records to every connected app (never affects the ack above)
+    # push to every connected app (never affects the ack above)
     for d in items:
         data = {k: v for k, v in d.items() if k != "_id"}
         await hub.broadcast({"type": "update", "cow_id": d["cow_id"], "data": data})
+
 
 
 # --------------------------------------------------------------------------
@@ -240,21 +299,24 @@ async def handle_dispatch(message: aio_pika.abc.AbstractIncomingMessage, cols: C
 
 
 async def ensure_index(cols: Cols):
-    try:
-        await cols.events.create_index([("cow_id", 1), ("date", -1)])
-        await cols.realtime.create_index([("cow_id", 1), ("received_at", -1)])
-        if settings.realtime_ttl_days > 0:
-            # auto-delete raw readings after N days
-            await cols.realtime.create_index(
-                "received_at", expireAfterSeconds=settings.realtime_ttl_days * 86400)
-        await cols.daily.create_index([("cow_id", 1), ("date", -1)])
-    except Exception:
-        log.exception("Could not create indexes (will continue)")
-    try:
+    # (collection, keys, options). Each index is created on its own, so one that
+    # fails (for example because an option changed) never blocks the others.
+    specs = [
+        (cols.events,   [("cow_id", 1), ("date", -1)], {}),
+        (cols.daily,    [("cow_id", 1), ("date", -1)], {}),
+        (cols.realtime, [("cow_id", 1), ("received_at", -1)], {}),
         # one feeding per cow per day, enforced by the database
-        await cols.dispatch.create_index([("cow_id", 1), ("date", 1)], unique=True)
-    except Exception:
-        log.exception("Could not create the feed_dispatch unique index (will continue)")
+        (cols.dispatch, [("cow_id", 1), ("date", 1)], {"unique": True}),
+    ]
+    if settings.realtime_ttl_days > 0:
+        # auto-delete raw readings after N days
+        specs.append((cols.realtime, [("received_at", 1)],
+                      {"expireAfterSeconds": settings.realtime_ttl_days * 86400}))
+    for col, keys, options in specs:
+        try:
+            await col.create_index(keys, **options)
+        except Exception:
+            log.exception("Could not create index %s on %s (will continue)", keys, col.name)
 
 
 async def pump(connection, queue_name: str, handler, cols: Cols):
@@ -268,27 +330,23 @@ async def pump(connection, queue_name: str, handler, cols: Cols):
             await handler(message, cols)
 
 
-async def consume(cols: Cols):
-    # Keep retrying: the Tailscale tunnel may need a few seconds, and the Pi may be offline
+async def run_queue(queue_name: str, handler, cols: Cols):
+    """Consume one queue for ever.
+
+    Every queue gets its own connection and retry loop, so a queue that is
+    missing or unreachable never stops the others. Retrying matters here: the
+    Tailscale tunnel may need a few seconds and the Pi may be offline.
+    """
     while True:
-        tasks = []
         try:
             connection = await aio_pika.connect_robust(settings.amqp_url)
             async with connection:
-                tasks = [asyncio.create_task(pump(connection, settings.queue_name, handle, cols))]
-                if settings.dispatch_queue:
-                    tasks.append(asyncio.create_task(
-                        pump(connection, settings.dispatch_queue, handle_dispatch, cols)))
-                await asyncio.gather(*tasks)
+                await pump(connection, queue_name, handler, cols)
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("AMQP connection failed, retrying in 5 s")
-            await asyncio.sleep(5)
-        finally:
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            log.exception("Queue %s: consumer stopped, retrying in 5 s", queue_name)
+        await asyncio.sleep(5)
 
 
 @asynccontextmanager
@@ -297,7 +355,12 @@ async def lifespan(app: FastAPI):
     cols = Cols(client[settings.mongo_db])
     app.state.cols = cols
     app.state.col = cols.events      # existing endpoints keep using this
-    tasks = [asyncio.create_task(consume(cols)), asyncio.create_task(ensure_index(cols))]
+    queues = [(settings.daily_queue, handle_daily),
+              (settings.realtime_queue, handle_realtime),
+              (settings.dispatch_queue, handle_dispatch)]
+    # one independent consumer per queue; an empty name disables that queue
+    tasks = [asyncio.create_task(run_queue(q, h, cols)) for q, h in queues if q]
+    tasks.append(asyncio.create_task(ensure_index(cols)))
     yield
     for t in tasks:
         t.cancel()
@@ -316,6 +379,8 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/health")
 async def health():
     return {"status": "ok", "pi_ai_configured": bool(settings.pi_ai_url),
+            "daily_queue": settings.daily_queue or None,
+            "realtime_queue": settings.realtime_queue or None,
             "dispatch_queue": settings.dispatch_queue or None}
 
 
