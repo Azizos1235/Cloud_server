@@ -4,3 +4,7 @@ aio-pika
 pymongo>=4.13
 pydantic-settings
 httpx
+pyjwt
+bcrypt
+google-auth
+email-validator
