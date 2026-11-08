@@ -1,13 +1,14 @@
+"""WebSocket: /ws/cows?token=<JWT>"""
 import json
 import logging
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
-from ..database import Cols
-from ..dependencies import resolve_actor
-from ..services.ai_service import predict
-from ..services.cow_service import latest, owner_filter, owns
-from ..services.hub import hub, reply
+from app.db import Cols
+from app.deps import owner_filter, owns, resolve_actor
+from app.hub import hub, reply
+from app.services.ai import predict
+from app.utils import latest
 
 log = logging.getLogger("ingest")
 router = APIRouter()

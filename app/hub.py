@@ -1,17 +1,16 @@
+"""WebSocket hub: each client only receives the cows it owns."""
 import json
 import logging
 
 from fastapi import WebSocket
 from fastapi.encoders import jsonable_encoder
 
-from ..database import Cols
+from app.db import Cols
 
 log = logging.getLogger("ingest")
 
 
 class Hub:
-    """Keeps the connected clients. Each client only receives the cows it owns."""
-
     def __init__(self):
         self.clients: dict[WebSocket, dict] = {}   # websocket -> actor
 

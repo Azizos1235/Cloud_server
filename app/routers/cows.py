@@ -1,13 +1,23 @@
+"""Cows: what the Flutter CowService calls (all scoped to the caller)."""
 import logging
+from datetime import date as Date, datetime, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from ..dependencies import get_actor, owned_cow
-from ..services.ai_service import predict
-from ..services.cow_service import latest, owner_filter
+from app.config import settings
+from app.deps import admin_only, get_actor, owned_cow, owner_filter
+from app.jobs.appetite import run_for_day
+from app.services.ai import predict
+from app.utils import latest
 
 log = logging.getLogger("ingest")
-router = APIRouter(tags=["cows"])
+router = APIRouter()
+
+
+@router.get("/health")
+async def health():
+    return {"status": "ok", "pi_ai_configured": bool(settings.pi_ai_url)}
 
 
 @router.get("/cows")
@@ -62,3 +72,13 @@ async def dispatches(cow_id: str, request: Request, limit: int = Query(30, ge=1,
     cid = await owned_cow(request, actor, cow_id)
     cur = request.app.state.cols.dispatch.find({"cow_id": cid}, {"_id": 0}).sort("date", -1).limit(limit)
     return await cur.to_list(length=limit)
+
+
+@router.post("/appetite/run")
+async def run_appetite_now(request: Request, day: Optional[Date] = None,
+                           admin: dict = Depends(admin_only)):
+    """Run the end-of-day appetite job by hand for the admin's own cows (default: today, UTC)."""
+    cols = request.app.state.cols
+    ids = [p["_id"] async for p in cols.profiles.find({"admin_id": admin["id"]}, {"_id": 1})]
+    day = day or datetime.now(timezone.utc).date()
+    return {"date": day.isoformat(), "updated": await run_for_day(cols, day, ids)}

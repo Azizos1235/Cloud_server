@@ -27,6 +27,15 @@ class Settings(BaseSettings):
     pi_ai_timeout: float = 30.0
     realtime_ttl_days: int = 90                            # 0 = keep forever
 
+    # --- end-of-day appetite job ---
+    eod_enabled: bool = True
+    eod_hour: int = 23                                     # local time of the run
+    eod_minute: int = 55
+    timezone: str = "Africa/Tunis"
+    appetite_use_ai: bool = True                           # ask the Pi first, rule below as fallback
+    appetite_low_ratio: float = 0.5                        # eaten / offered below this = "low"
+    appetite_high_ratio: float = 0.9                       # eaten / offered above this = "high"
+
 
 settings = Settings()
 

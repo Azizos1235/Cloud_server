@@ -1,13 +1,21 @@
+"""Alerte: AlerteSysteme (see services/alerts.py) and AlerteAdministrateur."""
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 
-from ..dependencies import admin_only, get_actor, owned_cow, to_oid
-from ..schemas import AdminAlertIn
-from ..services.alert_service import alert_out, new_alert
+from app.deps import admin_only, get_actor, owned_cow
+from app.utils import alert_out, new_alert, to_oid
 
-router = APIRouter(prefix="/alerts", tags=["alerts"])
+router = APIRouter(prefix="/alerts")
+
+
+class AdminAlertIn(BaseModel):
+    message: str = Field(min_length=1, max_length=500)
+    severity: Literal["info", "warning", "critical"] = "info"
+    eleveur_id: Optional[str] = None      # empty = all the admin's éleveurs
+    cow_id: Optional[str] = None
 
 
 @router.post("")
@@ -34,7 +42,7 @@ async def create_admin_alert(body: AdminAlertIn, request: Request, admin: dict =
 @router.get("")
 async def list_alerts(request: Request, status: Optional[Literal["unread", "read"]] = None,
                       limit: int = Query(50, ge=1, le=200), actor: dict = Depends(get_actor)):
-    flt = {"admin_id": actor["id"]} if actor["role"] == "admin" else {"eleveur_id": actor["id"]}
+    flt = ({"admin_id": actor["id"]} if actor["role"] == "admin" else {"eleveur_id": actor["id"]})
     if status:
         flt["status"] = status
     cur = request.app.state.cols.alerts.find(flt).sort("created_at", -1).limit(limit)

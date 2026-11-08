@@ -1,12 +1,36 @@
-from datetime import datetime
+"""Vache (cow_profiles): only the admin creates, edits and deletes."""
+from datetime import date as Date, datetime
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from ..dependencies import admin_only, get_actor, owned_cow, to_oid
-from ..schemas import CowProfile
-from ..services.cow_service import owner_filter, profile_out
+from app.config import BREED_TYPE
+from app.deps import admin_only, get_actor, owned_cow, owner_filter
+from app.utils import age_months, profile_out, to_oid
 
-router = APIRouter(prefix="/profiles", tags=["profiles"])
+router = APIRouter(prefix="/profiles")
+
+
+class CowProfile(BaseModel):
+    birth_date: Date
+    weight_kg: float = Field(gt=0, le=1500)
+    type: Literal["beef", "dairy", "dual"]
+    breed: Literal["Holstein", "Jersey", "Angus", "Limousin", "Charolais", "Simmental"]
+    eleveur_id: Optional[str] = None      # the éleveur who looks after this cow
+
+    @field_validator("birth_date")
+    @classmethod
+    def valid_birth_date(cls, v: Date):
+        if not 0 < age_months(v) <= 240:
+            raise ValueError("birth_date must give an age between 1 and 240 months")
+        return v
+
+    @model_validator(mode="after")
+    def type_matches_breed(self):
+        if BREED_TYPE[self.breed] != self.type:
+            raise ValueError(f"{self.breed} is a {BREED_TYPE[self.breed]} breed, not {self.type}")
+        return self
 
 
 @router.put("/{cow_id}")

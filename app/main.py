@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -8,13 +7,12 @@ from fastapi.responses import JSONResponse
 from pymongo import AsyncMongoClient
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .config import settings
-from .database import Cols, ensure_index
-from .routers import alerts, cows, health, profiles, websocket
-from .services.ingestion import start_consumers
-
-log = logging.getLogger("ingest")
-log.info("AI service URL: %r (proxy: %r)", settings.pi_ai_url, settings.pi_proxy)
+from app.config import settings
+from app.db import Cols, ensure_index
+from app.ingest.consumer import run_queue
+from app.ingest.handlers import handle_daily, handle_dispatch, handle_realtime
+from app.jobs.appetite import appetite_scheduler
+from app.routers import alerts, cows, profiles, ws
 
 
 @asynccontextmanager
@@ -22,8 +20,13 @@ async def lifespan(app: FastAPI):
     client = AsyncMongoClient(settings.mongo_uri)
     cols = Cols(client[settings.mongo_db])
     app.state.cols = cols
-    tasks = start_consumers(cols)                       # one consumer per queue
+    queues = [(settings.daily_queue, handle_daily),
+              (settings.realtime_queue, handle_realtime),
+              (settings.dispatch_queue, handle_dispatch)]
+    tasks = [asyncio.create_task(run_queue(q, h, cols)) for q, h in queues if q]
     tasks.append(asyncio.create_task(ensure_index(cols)))
+    if settings.eod_enabled:
+        tasks.append(asyncio.create_task(appetite_scheduler(cols)))
     yield
     for t in tasks:
         t.cancel()
@@ -33,7 +36,7 @@ async def lifespan(app: FastAPI):
     await client.close()
 
 
-app = FastAPI(title="Mangeoire Intelligente API", lifespan=lifespan)
+app = FastAPI(lifespan=lifespan)
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -42,5 +45,7 @@ async def http_error(_: Request, exc: StarletteHTTPException):
     return JSONResponse({"error": exc.detail, "detail": exc.detail}, status_code=exc.status_code)
 
 
-for r in (health.router, cows.router, profiles.router, alerts.router, websocket.router):
-    app.include_router(r)
+app.include_router(cows.router)
+app.include_router(profiles.router)
+app.include_router(alerts.router)
+app.include_router(ws.router)

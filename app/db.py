@@ -1,6 +1,6 @@
 import logging
 
-from .config import settings
+from app.config import settings
 
 log = logging.getLogger("ingest")
 
