@@ -67,6 +67,12 @@ def daily_update(d: dict, now: datetime) -> UpdateOne:
     appetite = d.get("appetite_class")
     if isinstance(appetite, str) and appetite.strip():
         stage["appetite_class"] = {"$literal": appetite.strip()}
+
+    # NEW: percentages per appetite class, e.g. {"low": 10, "normal": 60, "high": 30}
+    pct = parse_appetite_pct(d.get("appetite_pct"))
+    if pct:
+        stage["appetite_pct"] = {"$literal": pct}              # $literal: this is a pipeline update
+
     avg = {"$set": {"avg_meal_duration_min": {"$cond": [
         {"$gt": ["$visits", 0]},
         {"$round": [{"$divide": ["$total_eating_minutes", "$visits"]}, 1]}, 0]}}}
@@ -90,3 +96,19 @@ def parse_dispatch(body: bytes) -> list[dict]:
                     "served_at": str(p.get("served_at")
                                      or datetime.now().isoformat(timespec="seconds"))})
     return out
+
+
+
+def parse_appetite_pct(raw) -> dict | None:
+    """{"low": 10, "normal": 60, "high": 30} -> cleaned dict, or None if invalid/missing."""
+    if not isinstance(raw, dict):
+        return None
+    out = {}
+    for k, v in raw.items():
+        try:
+            p = float(v)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= p <= 100:
+            out[str(k).strip().lower()] = round(p, 2)
+    return out or None
