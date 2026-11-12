@@ -29,6 +29,6 @@ socat TCP-LISTEN:8001,fork,reuseaddr,bind=127.0.0.1 \
   EXEC:"tailscale --socket=$SOCK nc $PI_HOST 8001" &
 sleep 2
 
-# bridge the Tailscale network directly to the FastAPI app
-socat TCP-LISTEN:10000,fork,reuseaddr,bind=100.96.96.40 TCP:127.0.0.1:${PORT:-10000} &
-exec uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-10000}"
+# IMPORTANT: Bind Uvicorn to 127.0.0.1 so Tailscale userspace proxy can intercept 
+# incoming traffic from the Tailscale IP and forward it to the app.
+exec uvicorn app.main:app --host 127.0.0.1 --port "${PORT:-10000}"
