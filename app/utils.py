@@ -1,5 +1,6 @@
 import math
-from datetime import date as Date, datetime, timezone
+import re
+from datetime import date as Date, datetime, timedelta, timezone
 from typing import Optional
 
 from bson import ObjectId
@@ -42,7 +43,37 @@ def profile_out(p: dict) -> dict:
     birth = p["birth_date"].date()
     return {"cow_id": p["_id"], "admin_id": sid(p.get("admin_id")), "eleveur_id": sid(p.get("eleveur_id")),
             "breed": p["breed"], "type": p["type"], "weight_kg": p["weight_kg"],
-            "birth_date": birth.isoformat(), "age_months": age_months(birth)}   # age is computed
+            "birth_date": birth.isoformat(), "age_months": age_months(birth),
+            "nfc_uid": p.get("nfc_uid")}   # age is computed
+
+
+def normalize_nfc_uid(value: str) -> str:
+    uid = value.strip().upper().replace(":", "").replace("-", "")
+    uid = "".join(uid.split())
+    if not re.fullmatch(r"[0-9A-F]{8,32}", uid):
+        raise ValueError("nfc_uid must be 8 to 32 hexadecimal characters")
+    return uid
+
+
+def is_subscription_expired(expires_at: Optional[datetime], now: Optional[datetime] = None) -> bool:
+    if expires_at is None:
+        return True
+    end = expires_at.replace(tzinfo=timezone.utc) if expires_at.tzinfo is None else expires_at.astimezone(timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    return end < current
+
+
+def as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def extended_subscription(expires_at: Optional[datetime], months: int, days_per_month: int,
+                          now: Optional[datetime] = None) -> datetime:
+    current = now or datetime.now(timezone.utc)
+    previous_end = as_utc(expires_at)
+    return max(current, previous_end or current) + timedelta(days=months * days_per_month)
 
 
 def alert_out(a: dict) -> dict:

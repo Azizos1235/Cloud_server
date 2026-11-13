@@ -4,10 +4,11 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator, model_validator
+from pymongo.errors import DuplicateKeyError
 
 from app.config import BREED_TYPE
 from app.deps import admin_only, get_actor, owned_cow, owner_filter
-from app.utils import age_months, profile_out, to_oid
+from app.utils import age_months, normalize_nfc_uid, profile_out, to_oid
 
 router = APIRouter(prefix="/profiles")
 
@@ -18,6 +19,12 @@ class CowProfile(BaseModel):
     type: Literal["beef", "dairy", "dual"]
     breed: Literal["Holstein", "Jersey", "Angus", "Limousin", "Charolais", "Simmental"]
     eleveur_id: Optional[str] = None      # the éleveur who looks after this cow
+    nfc_uid: Optional[str] = None
+
+    @field_validator("nfc_uid")
+    @classmethod
+    def valid_nfc_uid(cls, v: Optional[str]):
+        return normalize_nfc_uid(v) if v is not None else None
 
     @field_validator("birth_date")
     @classmethod
@@ -49,7 +56,15 @@ async def put_profile(cow_id: str, p: CowProfile, request: Request, admin: dict 
     doc = {"_id": cid, "admin_id": admin["id"], "eleveur_id": eleveur_id,
            "birth_date": datetime(p.birth_date.year, p.birth_date.month, p.birth_date.day),
            "weight_kg": p.weight_kg, "type": p.type, "breed": p.breed}
-    await cols.profiles.replace_one({"_id": cid}, doc, upsert=True)
+    if p.nfc_uid is not None:
+        duplicate = await cols.profiles.find_one({"nfc_uid": p.nfc_uid, "_id": {"$ne": cid}}, {"_id": 1})
+        if duplicate:
+            raise HTTPException(409, "NFC UID already assigned to another cow")
+        doc["nfc_uid"] = p.nfc_uid
+    try:
+        await cols.profiles.replace_one({"_id": cid}, doc, upsert=True)
+    except DuplicateKeyError:
+        raise HTTPException(409, "NFC UID already assigned to another cow")
     return profile_out(doc)
 
 
@@ -57,6 +72,20 @@ async def put_profile(cow_id: str, p: CowProfile, request: Request, admin: dict 
 async def list_profiles(request: Request, actor: dict = Depends(get_actor)):
     cur = request.app.state.cols.profiles.find(owner_filter(actor)).sort("_id", 1)
     return [profile_out(p) async for p in cur]
+
+
+@router.get("/by-nfc/{uid}")
+async def get_profile_by_nfc(uid: str, request: Request, actor: dict = Depends(get_actor)):
+    try:
+        normalized = normalize_nfc_uid(uid)
+    except ValueError:
+        raise HTTPException(400, "Invalid NFC UID")
+    profile = await request.app.state.cols.profiles.find_one(
+        {"nfc_uid": normalized, **owner_filter(actor)}
+    )
+    if profile is None:
+        raise HTTPException(404, "No profile for NFC UID")
+    return profile_out(profile)
 
 
 @router.get("/{cow_id}")

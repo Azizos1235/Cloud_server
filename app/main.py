@@ -12,7 +12,8 @@ from app.db import Cols, ensure_index
 from app.ingest.consumer import run_queue
 from app.ingest.handlers import handle_daily, handle_dispatch, handle_realtime
 from app.jobs.appetite import appetite_scheduler
-from app.routers import alerts, cows, profiles, ws
+from app.routers import alerts, auth, cows, eleveurs, invites, profiles, subscription, superuser, ws
+from app.security import ensure_bootstrap_superuser
 
 
 @asynccontextmanager
@@ -20,11 +21,12 @@ async def lifespan(app: FastAPI):
     client = AsyncMongoClient(settings.mongo_uri)
     cols = Cols(client[settings.mongo_db])
     app.state.cols = cols
+    await ensure_index(cols)
+    await ensure_bootstrap_superuser(cols)
     queues = [(settings.daily_queue, handle_daily),
               (settings.realtime_queue, handle_realtime),
               (settings.dispatch_queue, handle_dispatch)]
     tasks = [asyncio.create_task(run_queue(q, h, cols)) for q, h in queues if q]
-    tasks.append(asyncio.create_task(ensure_index(cols)))
     if settings.eod_enabled:
         tasks.append(asyncio.create_task(appetite_scheduler(cols)))
     yield
@@ -46,6 +48,11 @@ async def http_error(_: Request, exc: StarletteHTTPException):
 
 
 app.include_router(cows.router)
+app.include_router(auth.router)
+app.include_router(invites.router)
+app.include_router(eleveurs.router)
 app.include_router(profiles.router)
 app.include_router(alerts.router)
+app.include_router(subscription.router)
+app.include_router(superuser.router)
 app.include_router(ws.router)

@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     mongo_uri: str
     mongo_db: str = "farm"
     jwt_secret: str                                        # same secret as the auth backend
+    invite_ttl_hours: int = 24
+    jwt_expire_hours: int = 168
+    superuser_email: str = ""
+    superuser_password: str = ""
+    subscription_days_per_month: int = 30
 
     mongo_realtime_collection: str = "realtime_readings"   # LectureTempsReel, append only
     mongo_daily_collection: str = "daily_summaries"        # ResumeJournalier, one per cow per day
