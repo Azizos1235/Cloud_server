@@ -16,7 +16,10 @@ def load_payload(body: bytes) -> list:
 
 def parse_items(body: bytes) -> list[dict]:
     out = []
-    for d in load_payload(body):
+    items = load_payload(body)
+    if not items:
+        raise ValueError("message must contain at least one item")
+    for d in items:
         if not isinstance(d, dict) or "cow_id" not in d or "date" not in d:
             raise TypeError("every item must be an object with cow_id and date")
         d = dict(d)
@@ -31,13 +34,19 @@ def parse_items(body: bytes) -> list[dict]:
 
 
 def parse_ts(value, default: datetime) -> datetime:
-    if isinstance(value, str):
-        try:
-            t = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-        except ValueError:
-            return default
-        return t.astimezone(timezone.utc) if t.tzinfo else t.replace(tzinfo=timezone.utc)
-    return default
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise TypeError("received_at must be a string")
+    try:
+        timestamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("received_at must be a valid ISO datetime") from exc
+    return (
+        timestamp.astimezone(timezone.utc)
+        if timestamp.tzinfo
+        else timestamp.replace(tzinfo=timezone.utc)
+    )
 
 
 def daily_update(d: dict, now: datetime) -> UpdateOne:

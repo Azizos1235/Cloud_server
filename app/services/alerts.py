@@ -1,3 +1,4 @@
+import logging
 import math
 from datetime import datetime, timezone
 
@@ -6,6 +7,8 @@ from pymongo.errors import DuplicateKeyError
 from app.config import LOW_APPETITE, settings
 from app.db import Cols
 from app.utils import new_alert
+
+log = logging.getLogger("ingest")
 
 
 def _canonical_appetite_class(value) -> str | None:
@@ -63,4 +66,4 @@ async def appetite_alert(cols: Cols, cow_id: str, day: str, appetite_class, appe
     try:
         await cols.alerts.insert_one(doc)
     except DuplicateKeyError:
-        pass
+        log.info("Duplicate appetite alert ignored for cow=%s date=%s", cow_id, day)

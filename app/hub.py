@@ -51,6 +51,7 @@ class Hub:
             try:
                 await ws.send_text(text)
             except Exception:
+                log.exception("WebSocket send failed; removing client")
                 dead.append(ws)
         for ws in dead:
             self.clients.pop(ws, None)

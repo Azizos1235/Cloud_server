@@ -34,10 +34,19 @@ class DailyAppetiteIngestionTests(unittest.TestCase):
                 "status": "unavailable",
                 "detail": "model unavailable",
             },
+            {
+                "category": "normal",
+                "percentages": {
+                    "normal": 82.5,
+                    "decreasing": 12.0,
+                    "increasing": 5.5,
+                },
+                "alert": False,
+            },
         ]
 
         for appetite in appetites:
-            with self.subTest(status=appetite["status"]):
+            with self.subTest(status=appetite.get("status", "unspecified")):
                 operation = self.operation({
                     "cow_id": "COW123",
                     "date": "2026-11-14",
@@ -52,9 +61,23 @@ class DailyAppetiteIngestionTests(unittest.TestCase):
         operation = self.operation({
             "cow_id": "COW123",
             "date": "2026-11-14",
+            "food_consumed_g": 830,
+            "feed_offered_g": 8208.5,
         })
 
         self.assertNotIn("appetite", operation._doc[0]["$set"])
+        self.assertEqual(
+            operation._doc[0]["$set"]["total_food_consumed_g"]["$max"][-1],
+            830.0,
+        )
+        self.assertEqual(
+            operation._doc[0]["$set"]["total_feed_offered_g"]["$max"][-1],
+            8208.5,
+        )
+
+    def test_empty_message_list_is_not_accepted_as_a_successful_message(self):
+        with self.assertRaises(ValueError):
+            parse_items(b"[]")
 
     def test_resending_same_cow_and_date_updates_the_same_upsert(self):
         first_appetite = {"status": "unavailable", "detail": "pending"}
