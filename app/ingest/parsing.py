@@ -68,6 +68,9 @@ def daily_update(d: dict, now: datetime) -> UpdateOne:
     if isinstance(appetite, str) and appetite.strip():
         stage["appetite_class"] = {"$literal": appetite.strip()}
 
+    if "appetite" in d:
+        stage["appetite"] = {"$literal": d["appetite"]}
+
     # NEW: percentages per appetite class, e.g. {"low": 10, "normal": 60, "high": 30}
     pct = parse_appetite_pct(d.get("appetite_pct"))
     if pct:
