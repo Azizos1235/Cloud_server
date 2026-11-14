@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -7,6 +8,8 @@ import jwt
 from pymongo.errors import DuplicateKeyError
 
 from app.config import settings
+
+log = logging.getLogger(__name__)
 
 
 def _bcrypt_input(password: str) -> bytes:
@@ -26,7 +29,10 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 
 def create_access_token(user_id: str, role: str) -> str:
-    expires = datetime.now(timezone.utc) + timedelta(hours=settings.jwt_expire_hours)
+    expiry_hours = (
+        settings.eleveur_jwt_expire_hours if role == "eleveur" else settings.jwt_expire_hours
+    )
+    expires = datetime.now(timezone.utc) + timedelta(hours=expiry_hours)
     return jwt.encode({"sub": user_id, "role": role, "exp": expires}, settings.jwt_secret, algorithm="HS256")
 
 
@@ -57,3 +63,46 @@ async def ensure_bootstrap_superuser(cols) -> None:
     except DuplicateKeyError:
         if not await cols.superusers.find_one({}):
             raise
+
+
+async def ensure_default_admin(cols):
+    email = settings.default_admin_email.strip().lower()
+    if not email:
+        return None
+
+    existing = await cols.admins.find_one({"email": email}, {"_id": 1})
+    if existing is not None:
+        log.info("Default admin already exists")
+        return existing["_id"]
+
+    password = settings.default_admin_password
+    if not password:
+        return None
+    if len(password) < 8:
+        log.warning("Default admin creation skipped: password must be at least 8 characters")
+        return None
+
+    now = datetime.now(timezone.utc)
+    document = {
+        "name": settings.default_admin_name,
+        "email": email,
+        "password_hash": hash_password(password),
+        "phone": None,
+        "must_change_password": False,
+        "subscription_expires_at": now + timedelta(
+            days=settings.default_admin_months * settings.subscription_days_per_month
+        ),
+        "status": "active",
+        "created_at": now,
+    }
+    try:
+        result = await cols.admins.insert_one(document)
+    except DuplicateKeyError:
+        existing = await cols.admins.find_one({"email": email}, {"_id": 1})
+        if existing is None:
+            raise
+        log.info("Default admin already exists")
+        return existing["_id"]
+
+    log.info("Default admin created")
+    return result.inserted_id

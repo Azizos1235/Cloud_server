@@ -1,24 +1,25 @@
-"""Vache (cow_profiles): only the admin creates, edits and deletes."""
+"""Cow profiles: admins and éleveurs create; only admins edit and delete."""
 from datetime import date as Date, datetime
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field, field_validator, model_validator
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pymongo.errors import DuplicateKeyError
 
 from app.config import BREED_TYPE
 from app.deps import admin_only, get_actor, owned_cow, owner_filter
-from app.utils import age_months, normalize_nfc_uid, profile_out, to_oid
+from app.utils import age_months, normalize_nfc_uid, profile_out
 
 router = APIRouter(prefix="/profiles")
 
 
 class CowProfile(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     birth_date: Date
     weight_kg: float = Field(gt=0, le=1500)
     type: Literal["beef", "dairy", "dual"]
     breed: Literal["Holstein", "Jersey", "Angus", "Limousin", "Charolais", "Simmental"]
-    eleveur_id: Optional[str] = None      # the éleveur who looks after this cow
     nfc_uid: Optional[str] = None
 
     @field_validator("nfc_uid")
@@ -40,31 +41,40 @@ class CowProfile(BaseModel):
         return self
 
 
-@router.put("/{cow_id}")
-async def put_profile(cow_id: str, p: CowProfile, request: Request, admin: dict = Depends(admin_only)):
+class CowProfileCreate(CowProfile):
+    cow_id: str
+
+    @field_validator("cow_id")
+    @classmethod
+    def normalize_cow_id(cls, value: str) -> str:
+        cow_id = value.strip().upper()
+        if not cow_id:
+            raise ValueError("cow_id is required")
+        return cow_id
+
+
+@router.post("", status_code=status.HTTP_201_CREATED)
+async def create_profile(p: CowProfileCreate, request: Request, actor: dict = Depends(get_actor)):
     cols = request.app.state.cols
-    cid = cow_id.strip().upper()
-    existing = await cols.profiles.find_one({"_id": cid}, {"admin_id": 1})
-    if existing and existing["admin_id"] != admin["id"]:
-        raise HTTPException(404, f"No profile for cow {cid}")      # another admin's cow
-    eleveur_id = None
-    if p.eleveur_id:
-        eleveur_id = to_oid(p.eleveur_id)
-        # an admin can only assign his own éleveurs (the auth backend must store admin_id)
-        if not await cols.eleveurs.find_one({"_id": eleveur_id, "admin_id": admin["id"]}, {"_id": 1}):
-            raise HTTPException(400, "This éleveur does not belong to you")
-    doc = {"_id": cid, "admin_id": admin["id"], "eleveur_id": eleveur_id,
+    cid = p.cow_id
+    if actor["role"] == "eleveur" and p.nfc_uid is None:
+        raise HTTPException(422, "nfc_uid is required for an éleveur")
+    if await cols.profiles.find_one({"_id": cid}, {"_id": 1}):
+        raise HTTPException(409, f"Cow {cid} already exists")
+    if p.nfc_uid is not None and await cols.profiles.find_one(
+        {"nfc_uid": p.nfc_uid}, {"_id": 1}
+    ):
+        raise HTTPException(409, "NFC UID already assigned to another cow")
+
+    doc = {"_id": cid, "admin_id": actor["admin_id"],
            "birth_date": datetime(p.birth_date.year, p.birth_date.month, p.birth_date.day),
            "weight_kg": p.weight_kg, "type": p.type, "breed": p.breed}
     if p.nfc_uid is not None:
-        duplicate = await cols.profiles.find_one({"nfc_uid": p.nfc_uid, "_id": {"$ne": cid}}, {"_id": 1})
-        if duplicate:
-            raise HTTPException(409, "NFC UID already assigned to another cow")
         doc["nfc_uid"] = p.nfc_uid
     try:
-        await cols.profiles.replace_one({"_id": cid}, doc, upsert=True)
+        await cols.profiles.insert_one(doc)
     except DuplicateKeyError:
-        raise HTTPException(409, "NFC UID already assigned to another cow")
+        raise HTTPException(409, "Cow ID or NFC UID already exists")
     return profile_out(doc)
 
 
@@ -92,6 +102,31 @@ async def get_profile_by_nfc(uid: str, request: Request, actor: dict = Depends(g
 async def get_profile(cow_id: str, request: Request, actor: dict = Depends(get_actor)):
     cid = await owned_cow(request, actor, cow_id)
     return profile_out(await request.app.state.cols.profiles.find_one({"_id": cid}))
+
+
+@router.put("/{cow_id}")
+async def put_profile(cow_id: str, p: CowProfile, request: Request, admin: dict = Depends(admin_only)):
+    cols = request.app.state.cols
+    cid = cow_id.strip().upper()
+    existing = await cols.profiles.find_one({"_id": cid}, {"admin_id": 1, "nfc_uid": 1})
+    if existing and existing.get("admin_id") != admin["admin_id"]:
+        raise HTTPException(404, f"No profile for cow {cid}")      # another admin's cow
+    nfc_uid = p.nfc_uid
+    if "nfc_uid" not in p.model_fields_set and existing:
+        nfc_uid = existing.get("nfc_uid")
+    doc = {"_id": cid, "admin_id": admin["admin_id"],
+           "birth_date": datetime(p.birth_date.year, p.birth_date.month, p.birth_date.day),
+           "weight_kg": p.weight_kg, "type": p.type, "breed": p.breed}
+    if nfc_uid is not None:
+        duplicate = await cols.profiles.find_one({"nfc_uid": nfc_uid, "_id": {"$ne": cid}}, {"_id": 1})
+        if duplicate:
+            raise HTTPException(409, "NFC UID already assigned to another cow")
+        doc["nfc_uid"] = nfc_uid
+    try:
+        await cols.profiles.replace_one({"_id": cid}, doc, upsert=True)
+    except DuplicateKeyError:
+        raise HTTPException(409, "NFC UID already assigned to another cow")
+    return profile_out(doc)
 
 
 @router.delete("/{cow_id}")

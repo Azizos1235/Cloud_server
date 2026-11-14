@@ -13,9 +13,15 @@ class Settings(BaseSettings):
     jwt_secret: str                                        # same secret as the auth backend
     invite_ttl_hours: int = 24
     jwt_expire_hours: int = 168
+    eleveur_jwt_expire_hours: int = 8760
     superuser_email: str = ""
     superuser_password: str = ""
     subscription_days_per_month: int = 30
+    appetite_alert_threshold: float = 65
+    default_admin_email: str = ""
+    default_admin_password: str = ""
+    default_admin_name: str = "Default Admin"
+    default_admin_months: int = 12
 
     mongo_realtime_collection: str = "realtime_readings"   # LectureTempsReel, append only
     mongo_daily_collection: str = "daily_summaries"        # ResumeJournalier, one per cow per day

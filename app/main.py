@@ -8,12 +8,12 @@ from pymongo import AsyncMongoClient
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import settings
-from app.db import Cols, ensure_index
+from app.db import Cols, adopt_orphans, ensure_index
 from app.ingest.consumer import run_queue
 from app.ingest.handlers import handle_daily, handle_dispatch, handle_realtime
 from app.jobs.appetite import appetite_scheduler
 from app.routers import alerts, auth, cows, eleveurs, invites, profiles, subscription, superuser, ws
-from app.security import ensure_bootstrap_superuser
+from app.security import ensure_bootstrap_superuser, ensure_default_admin
 
 
 @asynccontextmanager
@@ -23,6 +23,9 @@ async def lifespan(app: FastAPI):
     app.state.cols = cols
     await ensure_index(cols)
     await ensure_bootstrap_superuser(cols)
+    default_admin_id = await ensure_default_admin(cols)
+    if default_admin_id is not None:
+        await adopt_orphans(cols, default_admin_id)
     queues = [(settings.daily_queue, handle_daily),
               (settings.realtime_queue, handle_realtime),
               (settings.dispatch_queue, handle_dispatch)]

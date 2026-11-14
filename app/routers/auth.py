@@ -1,16 +1,17 @@
 import hashlib
+import logging
 from datetime import datetime, timezone
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
-from pymongo.errors import DuplicateKeyError
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from jwt import InvalidTokenError
 
-from app.deps import get_actor_allow_expired, rate_limit
-from app.security import create_access_token, hash_password, verify_password
+from app.deps import _bearer_token, get_actor_allow_expired, get_superuser, rate_limit
+from app.security import create_access_token, decode_access_token, hash_password, verify_password
 from app.utils import sid
 
 router = APIRouter(prefix="/auth")
+log = logging.getLogger(__name__)
 
 
 class LoginIn(BaseModel):
@@ -19,11 +20,18 @@ class LoginIn(BaseModel):
 
 
 class EleveurRegisterIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     invite_code: str
     name: str
-    email: str
-    password: str = Field(min_length=8)
-    phone: Optional[str] = None
+
+    @field_validator("name")
+    @classmethod
+    def trim_and_validate_name(cls, value: str) -> str:
+        value = value.strip()
+        if not 2 <= len(value) <= 60:
+            raise ValueError("name must be between 2 and 60 characters")
+        return value
 
 
 class ChangePasswordIn(BaseModel):
@@ -39,9 +47,10 @@ def _public_user(document: dict, role: str) -> dict:
     user = {
         "id": sid(document["_id"]),
         "name": document.get("name"),
-        "email": document["email"],
         "role": role,
     }
+    if role != "eleveur":
+        user["email"] = document["email"]
     if role == "eleveur":
         user["admin_id"] = sid(document.get("admin_id"))
     if role == "admin":
@@ -67,11 +76,6 @@ async def admin_login(body: LoginIn, request: Request, _: None = Depends(rate_li
     return await _login(request, "admin", body)
 
 
-@router.post("/eleveur/login")
-async def eleveur_login(body: LoginIn, request: Request, _: None = Depends(rate_limit)):
-    return await _login(request, "eleveur", body)
-
-
 @router.post("/superuser/login")
 async def superuser_login(body: LoginIn, request: Request, _: None = Depends(rate_limit)):
     return await _login(request, "superuser", body)
@@ -82,11 +86,6 @@ async def eleveur_register(
     body: EleveurRegisterIn, request: Request, _: None = Depends(rate_limit)
 ):
     cols = request.app.state.cols
-    email = _email(body.email)
-    if await cols.eleveurs.find_one({"email": email}, {"_id": 1}):
-        raise HTTPException(409, "Email already registered")
-
-    password_hash = hash_password(body.password)
     now = datetime.now(timezone.utc)
     code_hash = hashlib.sha256(body.invite_code.encode("utf-8")).hexdigest()
     invite = await cols.invites.find_one_and_update(
@@ -97,36 +96,54 @@ async def eleveur_register(
         raise HTTPException(404, "Invitation invalid or expired")
 
     document = {
-        "name": body.name.strip(),
-        "email": email,
-        "phone": body.phone,
-        "password_hash": password_hash,
+        "name": body.name,
         "admin_id": invite["admin_id"],
         "created_at": now,
     }
+    inserted_id = None
     try:
         inserted = await cols.eleveurs.insert_one(document)
-    except DuplicateKeyError:
-        await cols.invites.update_one(
+        inserted_id = inserted.inserted_id
+        invite_update = await cols.invites.update_one(
             {"_id": invite["_id"], "used_at": now},
-            {"$set": {"used_at": None, "used_by": None}},
+            {"$set": {"used_by": inserted_id}},
         )
-        raise HTTPException(409, "Email already registered")
-    document["_id"] = inserted.inserted_id
-    await cols.invites.update_one(
-        {"_id": invite["_id"], "used_at": now},
-        {"$set": {"used_by": inserted.inserted_id}},
-    )
-    return {
-        "token": create_access_token(str(inserted.inserted_id), "eleveur"),
-        "user": _public_user(document, "eleveur"),
-    }
+        if invite_update.matched_count == 0:
+            raise RuntimeError("Invitation claim was lost during registration")
+        document["_id"] = inserted_id
+        return {
+            "token": create_access_token(str(inserted_id), "eleveur"),
+            "user": _public_user(document, "eleveur"),
+        }
+    except Exception:
+        try:
+            if inserted_id is not None:
+                await cols.eleveurs.delete_one({"_id": inserted_id})
+            await cols.invites.update_one(
+                {"_id": invite["_id"], "used_at": now},
+                {"$set": {"used_at": None, "used_by": None}},
+            )
+        except Exception:
+            log.exception("Failed to roll back éleveur invite registration")
+        raise
 
 
 @router.get("/me")
-async def auth_me(request: Request, actor: dict = Depends(get_actor_allow_expired)):
+async def auth_me(request: Request):
+    try:
+        claims = decode_access_token(_bearer_token(request))
+    except InvalidTokenError:
+        raise HTTPException(401, "Invalid or expired token")
+
+    if claims.get("role") == "superuser":
+        actor = await get_superuser(request)
+        collection_name = "superusers"
+    else:
+        actor = await get_actor_allow_expired(request)
+        collection_name = "admins" if actor["role"] == "admin" else "eleveurs"
+
     cols = request.app.state.cols
-    collection = cols.admins if actor["role"] == "admin" else cols.eleveurs
+    collection = getattr(cols, collection_name)
     user = await collection.find_one({"_id": actor["id"]})
     if user is None:
         raise HTTPException(401, "Invalid token")

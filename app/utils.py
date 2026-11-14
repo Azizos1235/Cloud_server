@@ -41,7 +41,7 @@ def age_months(birth: Date) -> int:
 
 def profile_out(p: dict) -> dict:
     birth = p["birth_date"].date()
-    return {"cow_id": p["_id"], "admin_id": sid(p.get("admin_id")), "eleveur_id": sid(p.get("eleveur_id")),
+    return {"cow_id": p["_id"], "admin_id": sid(p.get("admin_id")),
             "breed": p["breed"], "type": p["type"], "weight_kg": p["weight_kg"],
             "birth_date": birth.isoformat(), "age_months": age_months(birth),
             "nfc_uid": p.get("nfc_uid")}   # age is computed
@@ -77,14 +77,17 @@ def extended_subscription(expires_at: Optional[datetime], months: int, days_per_
 
 
 def alert_out(a: dict) -> dict:
-    out = {k: v for k, v in a.items() if k not in ("_id", "dedupe_key")}
-    out.update(id=str(a["_id"]), admin_id=sid(a.get("admin_id")), eleveur_id=sid(a.get("eleveur_id")))
+    out = {k: v for k, v in a.items() if k not in ("_id", "dedupe_key", "eleveur_id")}
+    for field in ("message", "severity", "cow_id", "action", "type",
+                  "appetite_class", "appetite_pct", "status", "created_at"):
+        out.setdefault(field, None)
+    out.update(id=str(a["_id"]), admin_id=sid(a.get("admin_id")))
     return out
 
 
 def new_alert(source, type_, severity, message, cow_id, admin_id, eleveur_id, now, **extra) -> dict:
     return {"source": source, "type": type_, "severity": severity, "message": message,
-            "cow_id": cow_id, "admin_id": admin_id, "eleveur_id": eleveur_id,
+            "cow_id": cow_id, "admin_id": admin_id,
             "status": "unread", "created_at": now, "read_at": None, **extra}
 
 

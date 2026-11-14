@@ -6,11 +6,11 @@ import aio_pika
 from pymongo import UpdateOne
 from pymongo.errors import DuplicateKeyError
 
-from app.config import LOW_APPETITE, READING_FIELDS
+from app.config import READING_FIELDS
 from app.db import Cols
 from app.hub import hub
 from app.ingest.parsing import daily_update, parse_dispatch, parse_items, parse_ts
-from app.services.alerts import low_appetite_alert
+from app.services.alerts import appetite_alert
 
 log = logging.getLogger("ingest")
 
@@ -22,8 +22,10 @@ async def handle_daily(message: aio_pika.abc.AbstractIncomingMessage, cols: Cols
             now = datetime.now(timezone.utc)
             await cols.daily.bulk_write([daily_update(d, now) for d in items], ordered=False)
             for d in items:
-                if str(d.get("appetite_class", "")).strip().lower() in LOW_APPETITE:
-                    await low_appetite_alert(cols, d["cow_id"], d["date"])
+                if d.get("appetite_class") and d.get("appetite_pct"):
+                    await appetite_alert(
+                        cols, d["cow_id"], d["date"], d["appetite_class"], d["appetite_pct"]
+                    )
             log.info("Daily: stored %d record(s), e.g. %s", len(items), items[0]["_id"])
         await message.ack()
     except (ValueError, TypeError):

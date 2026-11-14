@@ -45,10 +45,11 @@ async def on_client_message(ws: WebSocket, cols: Cols, actor: dict, msg: dict):
 async def ws_cows(ws: WebSocket, token: str = Query("")):
     cols = ws.app.state.cols
     actor = await resolve_actor(cols, token)
+    await ws.accept()
     if actor is None:
+        # Accept first so the client receives an actual WebSocket close code.
         await ws.close(code=1008)
         return
-    await ws.accept()
     hub.clients[ws] = actor
     try:
         while True:

@@ -3,14 +3,15 @@
 Every day at EOD_HOUR:EOD_MINUTE (local time, TIMEZONE) it looks at today's
 summaries that have no appetite_class or no appetite_pct yet and stores:
 
-    appetite_class        "low" | "normal" | "high"   (or whatever the Pi returns)
+    appetite_class        the classifier's appetite label
     appetite_pct          {"low": 10.0, "normal": 60.0, "high": 30.0}
     appetite_source       "ai" | "rule"
     appetite_computed_at  UTC timestamp
 
 A value already sent by the ESP32 is never overwritten: if the device sent the
-class but no percentages, only the percentages are filled in. Low appetite
-raises the same system alert as the live path (deduplicated per cow and day).
+class but no percentages, only the percentages are filled in. Appetite alerts
+are evaluated by the same live-path rule: a canonical low/high class
+alerts only when its class percentage exceeds the configured threshold.
 """
 import asyncio
 import logging
@@ -18,10 +19,10 @@ from datetime import date as Date, datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from app.config import LOW_APPETITE, settings
+from app.config import settings
 from app.db import Cols
 from app.services.ai import predict
-from app.services.alerts import low_appetite_alert
+from app.services.alerts import appetite_alert
 
 log = logging.getLogger("ingest")
 
@@ -136,8 +137,11 @@ async def run_for_day(cols: Cols, day: Date, cow_ids: Optional[list[str]] = None
                 {"$set": update})
             if res.modified_count:
                 written += 1
-                if not has_class and label.lower() in LOW_APPETITE:
-                    await low_appetite_alert(cols, doc["cow_id"], day.isoformat())
+                effective_label = doc.get("appetite_class") if has_class else label
+                effective_pct = doc.get("appetite_pct") if has_pct else pct
+                await appetite_alert(
+                    cols, doc["cow_id"], day.isoformat(), effective_label, effective_pct
+                )
         except Exception:
             log.exception("Appetite job failed for %s", doc.get("_id"))
     log.info("Appetite job %s: %d summary(ies) updated", day, written)

@@ -49,6 +49,7 @@ async def _load_actor(cols, token: str, *, allow_expired: bool, allow_password_c
             raise HTTPException(403, "Password change required")
         if not allow_expired and is_subscription_expired(user.get("subscription_expires_at")):
             raise HTTPException(402, "Subscription expired")
+        admin_id = user_id
     else:
         admin_id = user.get("admin_id")
         if not isinstance(admin_id, ObjectId):
@@ -59,7 +60,7 @@ async def _load_actor(cols, token: str, *, allow_expired: bool, allow_password_c
         if not allow_expired and is_subscription_expired(admin.get("subscription_expires_at")):
             raise HTTPException(402, "Subscription expired")
 
-    return {"id": user_id, "role": role}
+    return {"id": user_id, "role": role, "admin_id": admin_id}
 
 
 async def get_actor(request: Request):
@@ -99,9 +100,7 @@ async def admin_only(actor: dict = Depends(get_actor)):
 
 
 def owner_filter(actor: dict) -> dict:
-    if actor["role"] == "admin":
-        return {"admin_id": actor["id"]}
-    return {"eleveur_id": actor["id"]}
+    return {"admin_id": actor["admin_id"]}
 
 
 async def owns(cols, actor: dict, cow_id: str) -> bool:

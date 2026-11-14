@@ -4,6 +4,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
+from pymongo.errors import DuplicateKeyError
 
 from app.deps import get_actor_allow_expired, rate_limit
 from app.utils import as_utc, is_subscription_expired, sid
@@ -45,7 +46,10 @@ async def create_signup_request(body: SignupRequestIn, request: Request):
         "created_at": datetime.now(timezone.utc),
         "decided_at": None,
     }
-    result = await cols.subscription_requests.insert_one(document)
+    try:
+        result = await cols.subscription_requests.insert_one(document)
+    except DuplicateKeyError:
+        raise HTTPException(409, "A pending request with this email already exists")
     return {"id": sid(result.inserted_id), "status": "pending"}
 
 
