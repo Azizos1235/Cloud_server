@@ -24,7 +24,7 @@ class Cols:
 async def _ensure_pending_request_email_index(col):
     expected_partial_filter = {"status": "pending"}
     expected_index_exists = False
-    async for index in col.list_indexes():
+    async for index in await col.list_indexes():
         keys = index.get("key", {})
         if list(keys.items()) != [("email", 1)]:
             continue
@@ -44,7 +44,7 @@ async def _ensure_pending_request_email_index(col):
 
 
 async def ensure_index(cols: Cols):
-    async for index in cols.eleveurs.list_indexes():
+    async for index in await cols.eleveurs.list_indexes():
         keys = index.get("key", {})
         if index.get("unique") and list(keys.items()) == [("email", 1)]:
             await cols.eleveurs.drop_index(index["name"])
