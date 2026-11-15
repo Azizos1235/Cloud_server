@@ -100,6 +100,15 @@ async def admin_only(actor: dict = Depends(get_actor)):
     return actor
 
 
+async def admin_or_eleveur(actor: dict = Depends(get_actor)) -> ObjectId:
+    if actor.get("role") not in ("admin", "eleveur"):
+        raise HTTPException(403, "Admin or éleveur access required")
+    admin_id = actor.get("admin_id")
+    if not isinstance(admin_id, ObjectId):
+        raise HTTPException(401, "Invalid token")
+    return admin_id
+
+
 def owner_filter(actor: dict) -> dict:
     return {"admin_id": actor["admin_id"]}
 

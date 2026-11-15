@@ -1,14 +1,15 @@
-"""Cow profiles: admins and éleveurs create; only admins edit and delete."""
+"""Cow profiles: admins and éleveurs create and update; only admins delete."""
 from datetime import date as Date, datetime
 from typing import Literal, Optional
 
+from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pymongo.errors import DuplicateKeyError
 
 from app.config import BREED_TYPE
 from app.cow_ids import cow_data_filter, normalize_cow_identifier
-from app.deps import admin_only, get_actor, owned_cow, owner_filter
+from app.deps import admin_only, admin_or_eleveur, get_actor, owned_cow, owner_filter
 from app.utils import age_months, normalize_nfc_uid, profile_out
 
 router = APIRouter(prefix="/profiles")
@@ -126,36 +127,61 @@ async def get_profile(cow_id: str, request: Request, actor: dict = Depends(get_a
 
 
 @router.put("/{cow_id}")
-async def put_profile(cow_id: str, p: CowProfile, request: Request, admin: dict = Depends(admin_only)):
+async def put_profile(
+    cow_id: str,
+    p: CowProfile,
+    request: Request,
+    admin_id: ObjectId = Depends(admin_or_eleveur),
+):
     cols = request.app.state.cols
     identifier = normalize_cow_identifier(cow_id)
     existing = await cols.profiles.find_one(
-        {"$or": [{"_id": identifier}, {"cow_id": identifier}]},
-        {"_id": 1, "cow_id": 1, "admin_id": 1, "nfc_uid": 1},
+        {
+            "$or": [{"_id": identifier}, {"cow_id": identifier}],
+            "admin_id": admin_id,
+        }
     )
-    cid = existing.get("cow_id", existing["_id"]) if existing else identifier
-    if existing and existing.get("admin_id") != admin["admin_id"]:
-        raise HTTPException(404, f"No profile for cow {cid}")      # another admin's cow
-    nfc_uid = p.nfc_uid
-    if "nfc_uid" not in p.model_fields_set and existing:
-        nfc_uid = existing.get("nfc_uid")
-    doc = {"_id": existing["_id"] if existing else cid,
-           "admin_id": admin["admin_id"],
-           "birth_date": datetime(p.birth_date.year, p.birth_date.month, p.birth_date.day),
-           "weight_kg": p.weight_kg, "type": p.type, "breed": p.breed}
-    if existing and existing.get("cow_id"):
-        doc["cow_id"] = existing["cow_id"]
-    if nfc_uid is not None:
+    if existing is None:
+        raise HTTPException(404, f"No profile for cow {identifier}")
+
+    updates = {
+        "birth_date": datetime(p.birth_date.year, p.birth_date.month, p.birth_date.day),
+        "weight_kg": p.weight_kg,
+        "type": p.type,
+        "breed": p.breed,
+    }
+    stored_birth_date = existing.get("birth_date")
+    if isinstance(stored_birth_date, datetime):
+        stored_birth_date = stored_birth_date.date()
+    if stored_birth_date != p.birth_date:
+        updates["age_months"] = age_months(p.birth_date)
+
+    unset = {}
+    if p.nfc_uid is not None:
         duplicate = await cols.profiles.find_one(
-            {"nfc_uid": nfc_uid, "_id": {"$ne": doc["_id"]}}, {"_id": 1}
+            {"nfc_uid": p.nfc_uid, "_id": {"$ne": existing["_id"]}}, {"_id": 1}
         )
         if duplicate:
             raise HTTPException(409, "NFC UID already assigned to another cow")
-        doc["nfc_uid"] = nfc_uid
+        updates["nfc_uid"] = p.nfc_uid
+    elif "nfc_uid" in p.model_fields_set:
+        unset["nfc_uid"] = ""
+
+    update = {"$set": updates}
+    if unset:
+        update["$unset"] = unset
     try:
-        await cols.profiles.replace_one({"_id": doc["_id"]}, doc, upsert=True)
+        result = await cols.profiles.update_one(
+            {"_id": existing["_id"], "admin_id": admin_id}, update
+        )
     except DuplicateKeyError:
         raise HTTPException(409, "NFC UID already assigned to another cow")
+    if result.matched_count == 0:
+        raise HTTPException(404, f"No profile for cow {identifier}")
+
+    doc = {**existing, **updates}
+    if unset:
+        doc.pop("nfc_uid", None)
     return profile_out(doc)
 
 
