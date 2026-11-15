@@ -50,7 +50,7 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-BREED_TYPE = {"Holstein": "dairy", "Jersey": "dairy", "Angus": "beef",
-              "Limousin": "beef", "Charolais": "beef", "Simmental": "dual"}
+BREED_TYPE = {"Holstein": "dairy", "Montbeliarde": "dual", "Brune": "dairy",
+              "Frisonne": "dairy"}
 READING_FIELDS = ("visits", "food_consumed_g", "feed_offered_g", "eating_minutes", "no_food_visits")
 LOW_APPETITE = {"low", "poor", "faible"}   # appetite_class values that raise a system alert

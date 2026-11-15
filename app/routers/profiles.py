@@ -20,7 +20,7 @@ class CowProfile(BaseModel):
     birth_date: Date
     weight_kg: float = Field(gt=0, le=1500)
     type: Literal["beef", "dairy", "dual"]
-    breed: Literal["Holstein", "Jersey", "Angus", "Limousin", "Charolais", "Simmental"]
+    breed: Literal["Holstein", "Montbeliarde", "Brune", "Frisonne"]
     nfc_uid: Optional[str] = None
 
     @field_validator("nfc_uid")
