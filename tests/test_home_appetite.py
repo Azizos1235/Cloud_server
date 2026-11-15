@@ -85,16 +85,19 @@ class HomeAppetiteEndpointTests(unittest.IsolatedAsyncioTestCase):
                     "RFID-01": {
                         "cow_id": "COW001",
                         "appetite": "increasing",
+                        "raw": "high",
                         "date": "2026-11-15",
                     },
                     "RFID-02": {
                         "cow_id": "COW002",
                         "appetite": None,
+                        "raw": None,
                         "date": None,
                     },
                     "RFID-03": {
                         "cow_id": "COW003",
                         "appetite": None,
+                        "raw": "unexpected-label",
                         "date": "2026-11-14",
                     },
                 }
@@ -119,6 +122,10 @@ class HomeAppetiteEndpointTests(unittest.IsolatedAsyncioTestCase):
             "stable": "stable",
             "high": "increasing",
             "increasing": "increasing",
+            " Low appetite ": "decreasing",
+            "NORMAL appetite": "stable",
+            "High appetite": "increasing",
+            "Very stable": "stable",
             "": None,
         }
 
@@ -149,3 +156,35 @@ class HomeAppetiteEndpointTests(unittest.IsolatedAsyncioTestCase):
                 )
 
                 self.assertEqual(response["appetite"]["RFID-01"]["appetite"], expected)
+                self.assertEqual(response["appetite"]["RFID-01"]["raw"], stored_label)
+
+    async def test_nested_appetite_category_is_used_when_no_class_is_stored(self):
+        profile_cursor = AsyncCursor([{"_id": "RFID-01", "cow_id": "COW001"}])
+        cols = SimpleNamespace(
+            profiles=SimpleNamespace(find=lambda *_args: profile_cursor),
+            daily=SimpleNamespace(
+                aggregate=lambda _pipeline: AsyncCursor(
+                    [
+                        {
+                            "_id": "RFID-01",
+                            "rfid": "RFID-01",
+                            "date": datetime(2026, 11, 15, tzinfo=timezone.utc),
+                            "appetite": {"category": "  Low appetite  "},
+                        }
+                    ]
+                )
+            ),
+        )
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(cols=cols)))
+
+        response = await home_appetite(request, {"admin_id": "admin-1"})
+
+        self.assertEqual(
+            response["appetite"]["RFID-01"],
+            {
+                "cow_id": "COW001",
+                "appetite": "decreasing",
+                "raw": "  Low appetite  ",
+                "date": "2026-11-15",
+            },
+        )

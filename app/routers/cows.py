@@ -28,7 +28,32 @@ _APPETITE_CLASS_ALIASES = {
 def _home_appetite_class(value: object) -> Optional[str]:
     if not isinstance(value, str):
         return None
-    return _APPETITE_CLASS_ALIASES.get(value.strip().lower())
+    label = value.strip().casefold()
+    if not label:
+        return None
+    exact_match = _APPETITE_CLASS_ALIASES.get(label)
+    if exact_match is not None:
+        return exact_match
+    for aliases, appetite in (
+        (("decreasing", "low"), "decreasing"),
+        (("stable", "normal"), "stable"),
+        (("increasing", "high"), "increasing"),
+    ):
+        if any(alias in label for alias in aliases):
+            return appetite
+    return None
+
+
+def _home_appetite_raw(record: dict) -> Optional[str]:
+    appetite_class = record.get("appetite_class")
+    if isinstance(appetite_class, str) and appetite_class.strip():
+        return appetite_class
+    appetite = record.get("appetite")
+    if isinstance(appetite, dict):
+        category = appetite.get("category")
+        if isinstance(category, str):
+            return category
+    return appetite_class if isinstance(appetite_class, str) else None
 
 
 def _home_appetite_date(value: object) -> Optional[str]:
@@ -97,6 +122,7 @@ async def home_appetite(request: Request, actor: dict = Depends(get_actor)):
         appetite_by_internal_id[internal_id] = {
             "cow_id": cow_id,
             "appetite": None,
+            "raw": None,
             "date": None,
         }
         rfid_to_internal_id[rfid] = internal_id
@@ -139,6 +165,7 @@ async def home_appetite(request: Request, actor: dict = Depends(get_actor)):
                 "rfid": "$record.rfid",
                 "date": "$record.date",
                 "appetite_class": "$record.appetite_class",
+                "appetite": "$record.appetite",
             }
         },
     ]
@@ -162,7 +189,8 @@ async def home_appetite(request: Request, actor: dict = Depends(get_actor)):
 
     for internal_id, record in latest_by_internal_id.items():
         appetite_by_internal_id[internal_id].update(
-            appetite=_home_appetite_class(record.get("appetite_class")),
+            appetite=_home_appetite_class(_home_appetite_raw(record)),
+            raw=_home_appetite_raw(record),
             date=_home_appetite_date(record.get("date")),
         )
 
