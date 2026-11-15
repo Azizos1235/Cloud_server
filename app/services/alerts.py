@@ -46,7 +46,9 @@ async def appetite_alert(cols: Cols, cow_id: str, day: str, appetite_class, appe
     if label not in {"low", "high"} or percentages.get(label, 0) <= settings.appetite_alert_threshold:
         return
 
-    profile = await cols.profiles.find_one({"_id": cow_id}, {"admin_id": 1})
+    profile = await cols.profiles.find_one(
+        {"$or": [{"cow_id": cow_id}, {"_id": cow_id}]}, {"admin_id": 1}
+    )
     if not profile or profile.get("admin_id") is None:
         return
 

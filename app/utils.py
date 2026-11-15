@@ -41,7 +41,8 @@ def age_months(birth: Date) -> int:
 
 def profile_out(p: dict) -> dict:
     birth = p["birth_date"].date()
-    return {"cow_id": p["_id"], "admin_id": sid(p.get("admin_id")),
+    return {"cow_id": p.get("cow_id") or p["_id"], "internal_id": sid(p["_id"]),
+            "admin_id": sid(p.get("admin_id")),
             "breed": p["breed"], "type": p["type"], "weight_kg": p["weight_kg"],
             "birth_date": birth.isoformat(), "age_months": age_months(birth),
             "nfc_uid": p.get("nfc_uid")}   # age is computed
@@ -91,5 +92,6 @@ def new_alert(source, type_, severity, message, cow_id, admin_id, eleveur_id, no
             "status": "unread", "created_at": now, "read_at": None, **extra}
 
 
-async def latest(col, cow_id: str):
-    return await col.find_one({"cow_id": cow_id}, {"_id": 0}, sort=[("date", -1)])
+async def latest(col, cow_filter: str | dict):
+    query = {"cow_id": cow_filter} if isinstance(cow_filter, str) else cow_filter
+    return await col.find_one(query, {"_id": 0}, sort=[("date", -1)])

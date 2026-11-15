@@ -20,6 +20,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from app.config import settings
+from app.cow_ids import resolve_cow_id
 from app.db import Cols
 from app.services.ai import predict
 from app.services.alerts import appetite_alert
@@ -86,11 +87,19 @@ def _pct_from_rule(doc: dict, label: str) -> dict:
     return {label.strip().lower(): round(min(ratio, 1) * 100, 2) if ratio is not None else 0.0}
 
 
-async def classify(doc: dict, known_label: Optional[str] = None) -> tuple[str, str, Optional[dict]]:
+async def classify(
+    doc: dict,
+    known_label: Optional[str] = None,
+    cols: Optional[Cols] = None,
+) -> tuple[str, str, Optional[dict]]:
     """Returns (class, source, percentages). If known_label is given, it is kept as the class."""
     if settings.appetite_use_ai:
         try:
-            result = _unwrap(await predict({"cow_id": doc["cow_id"]}))
+            cow_id = doc["cow_id"]
+            if cols is not None:
+                rfid = doc.get("rfid") or cow_id
+                cow_id = await resolve_cow_id(cols, rfid) or cow_id
+            result = _unwrap(await predict({"cow_id": cow_id}))
             label = known_label or _from_ai(result)
             if label:
                 return label, "ai", _pct_from_ai(result) or _pct_from_rule(doc, label)
@@ -112,7 +121,12 @@ async def run_for_day(cols: Cols, day: Date, cow_ids: Optional[list[str]] = None
     missing_any = _missing("appetite_class") + _missing("appetite_pct")
     flt: dict = {"date": day_dt, "$or": missing_any}
     if cow_ids is not None:
-        flt["cow_id"] = {"$in": cow_ids}
+        flt["$and"] = [
+            {"$or": [
+                {"cow_id": {"$in": cow_ids}},
+                {"rfid": {"$in": cow_ids}},
+            ]}
+        ]
 
     written = 0
     async for doc in cols.daily.find(flt):
@@ -121,7 +135,10 @@ async def run_for_day(cols: Cols, day: Date, cow_ids: Optional[list[str]] = None
             has_pct = bool(doc.get("appetite_pct"))
 
             label, source, pct = await classify(
-                doc, known_label=doc["appetite_class"].strip() if has_class else None)
+                doc,
+                known_label=doc["appetite_class"].strip() if has_class else None,
+                cols=cols,
+            )
 
             update: dict = {}
             if not has_class:
@@ -139,8 +156,11 @@ async def run_for_day(cols: Cols, day: Date, cow_ids: Optional[list[str]] = None
                 written += 1
                 effective_label = doc.get("appetite_class") if has_class else label
                 effective_pct = doc.get("appetite_pct") if has_pct else pct
+                cow_id = doc["cow_id"]
+                if doc.get("rfid"):
+                    cow_id = await resolve_cow_id(cols, doc["rfid"]) or cow_id
                 await appetite_alert(
-                    cols, doc["cow_id"], day.isoformat(), effective_label, effective_pct
+                    cols, cow_id, day.isoformat(), effective_label, effective_pct
                 )
         except Exception:
             log.exception("Appetite job failed for %s", doc.get("_id"))

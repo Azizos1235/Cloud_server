@@ -4,6 +4,7 @@ import logging
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
+from app.cow_ids import cow_data_filter, resolve_cow_id
 from app.db import Cols
 from app.deps import owner_filter, owns, resolve_actor
 from app.hub import hub, reply
@@ -26,13 +27,20 @@ async def on_client_message(ws: WebSocket, cols: Cols, actor: dict, msg: dict):
         elif kind in ("get", "ask") and cow_id:
             if not await owns(cols, actor, cow_id):
                 raise LookupError(f"No cow {cow_id}")
-            doc = await latest(cols.daily, cow_id)
+            cow_filter = await cow_data_filter(cols, cow_id)
+            doc = await latest(cols.daily, cow_filter)
             if doc is None:
                 raise LookupError(f"No data for cow {cow_id}")
             if kind == "get":
                 await reply(ws, {"type": "cow", "cow_id": echo_id, "data": doc})
             else:
-                await reply(ws, {"type": "ai", "cow_id": echo_id, "result": await predict(doc)})
+                rfid = doc.get("rfid") or doc["cow_id"]
+                resolved = await resolve_cow_id(cols, rfid)
+                await reply(ws, {
+                    "type": "ai",
+                    "cow_id": echo_id,
+                    "result": await predict({"cow_id": resolved or doc["cow_id"]}),
+                })
 
     except Exception as e:
         if not isinstance(e, (NotImplementedError, LookupError)):

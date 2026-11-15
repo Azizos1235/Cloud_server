@@ -6,6 +6,7 @@ from bson.errors import InvalidId
 from fastapi import Depends, HTTPException, Request
 from jwt import InvalidTokenError
 
+from app.cow_ids import normalize_cow_identifier, resolve_cow_id
 from app.security import decode_access_token
 from app.utils import is_subscription_expired
 
@@ -104,16 +105,33 @@ def owner_filter(actor: dict) -> dict:
 
 
 async def owns(cols, actor: dict, cow_id: str) -> bool:
-    cid = cow_id.strip().upper()
-    result = await cols.profiles.find_one({"_id": cid, **owner_filter(actor)}, {"_id": 1})
+    cid = normalize_cow_identifier(cow_id)
+    result = await cols.profiles.find_one(
+        {"$or": [{"_id": cid}, {"cow_id": cid}], **owner_filter(actor)},
+        {"_id": 1, "cow_id": 1},
+    )
     return result is not None
 
 
 async def owned_cow(request: Request, actor: dict, cow_id: str) -> str:
-    cid = cow_id.strip().upper()
-    if not await owns(request.app.state.cols, actor, cid):
-        raise HTTPException(404, f"No profile for cow {cid}")
-    return cid
+    cols = request.app.state.cols
+    identifier = normalize_cow_identifier(cow_id)
+    profile = await cols.profiles.find_one(
+        {"$or": [{"_id": identifier}, {"cow_id": identifier}], **owner_filter(actor)},
+        {"_id": 1, "cow_id": 1},
+    )
+    if profile is None:
+        raise HTTPException(404, f"No profile for cow {identifier}")
+
+    rfid = normalize_cow_identifier(profile["_id"])
+    resolved = await resolve_cow_id(cols, rfid)
+    if resolved:
+        return resolved
+    profile_cow_id = profile.get("cow_id")
+    if isinstance(profile_cow_id, str) and profile_cow_id.strip():
+        return profile_cow_id.strip().upper()
+    # Compatibility for profiles created before the RFID/cow-code schema.
+    return rfid
 
 
 async def resolve_actor(cols, token: str):

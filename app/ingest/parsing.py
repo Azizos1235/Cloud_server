@@ -23,12 +23,14 @@ def parse_items(body: bytes) -> list[dict]:
         if not isinstance(d, dict) or "cow_id" not in d or "date" not in d:
             raise TypeError("every item must be an object with cow_id and date")
         d = dict(d)
-        d["cow_id"] = str(d["cow_id"]).strip().upper()
-        if not d["cow_id"]:
+        rfid = str(d["cow_id"]).strip().upper()
+        if not rfid:
             raise ValueError("cow_id is empty")
+        d["rfid"] = rfid
+        d["cow_id"] = rfid
         d["date"] = str(d["date"]).strip()[:10]
         datetime.strptime(d["date"], "%Y-%m-%d")
-        d["_id"] = f'{d["cow_id"]}-{d["date"]}'
+        d["_id"] = f'{rfid}-{d["date"]}'
         out.append(d)
     return out
 
@@ -59,6 +61,7 @@ def daily_update(d: dict, now: datetime) -> UpdateOne:
     day = datetime.strptime(d["date"], "%Y-%m-%d").replace(tzinfo=timezone.utc)
     stage = {
         "cow_id": d["cow_id"],
+        "rfid": d["rfid"],
         "date": day,                                           # real date, not a string
         "first_reading_at": {"$ifNull": ["$first_reading_at", now]},
         "last_updated": now,

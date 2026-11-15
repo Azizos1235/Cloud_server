@@ -233,7 +233,14 @@ async def delete_admin(
         raise HTTPException(404, "Admin not found")
 
     eleveur_ids = [item["_id"] async for item in cols.eleveurs.find({"admin_id": oid}, {"_id": 1})]
-    cow_ids = [item["_id"] async for item in cols.profiles.find({"admin_id": oid}, {"_id": 1})]
+    cow_ids = [
+        identifier
+        async for item in cols.profiles.find(
+            {"admin_id": oid}, {"_id": 1, "cow_id": 1}
+        )
+        for identifier in (item["_id"], item.get("cow_id"))
+        if identifier
+    ]
     alert_filters = [{"admin_id": oid}]
     if eleveur_ids:
         alert_filters.append({"eleveur_id": {"$in": eleveur_ids}})

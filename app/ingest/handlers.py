@@ -9,12 +9,22 @@ from pymongo.errors import BulkWriteError, DuplicateKeyError, WriteError
 from pymongo.results import BulkWriteResult
 
 from app.config import READING_FIELDS, settings
+from app.cow_ids import resolve_cow_id
 from app.db import Cols
 from app.hub import hub
 from app.ingest.parsing import daily_update, parse_dispatch, parse_items, parse_ts
 from app.services.alerts import appetite_alert
 
 log = logging.getLogger("ingest")
+
+
+async def _resolve_items(items: list[dict], cols: Cols) -> None:
+    for item in items:
+        rfid = item["rfid"]
+        cow_id = await resolve_cow_id(cols, rfid)
+        if cow_id is None:
+            log.warning("No cow profile for RFID %s; storing unresolved message", rfid)
+        item["cow_id"] = cow_id
 
 
 def _log_message_received(queue_name: str, body: bytes) -> None:
@@ -81,6 +91,7 @@ async def handle_daily(message: aio_pika.abc.AbstractIncomingMessage, cols: Cols
     _log_message_received(settings.daily_queue, message.body)
     try:
         items = parse_items(message.body)
+        await _resolve_items(items, cols)
         now = datetime.now(timezone.utc)
         result = await cols.daily.bulk_write(
             [daily_update(d, now) for d in items],
@@ -94,7 +105,7 @@ async def handle_daily(message: aio_pika.abc.AbstractIncomingMessage, cols: Cols
                 item["_id"],
             )
         for d in items:
-            if d.get("appetite_class") and d.get("appetite_pct"):
+            if d["cow_id"] and d.get("appetite_class") and d.get("appetite_pct"):
                 await appetite_alert(
                     cols, d["cow_id"], d["date"], d["appetite_class"], d["appetite_pct"]
                 )
@@ -118,12 +129,14 @@ async def handle_realtime(message: aio_pika.abc.AbstractIncomingMessage, cols: C
         now = datetime.now(timezone.utc)
         ops = []
         keys = []
-        for d in parse_items(message.body):
+        items = parse_items(message.body)
+        await _resolve_items(items, cols)
+        for d in items:
             ts = parse_ts(d.get("received_at"), now)
-            doc = {"cow_id": d["cow_id"], "timestamp": ts,
+            doc = {"cow_id": d["cow_id"], "rfid": d["rfid"], "timestamp": ts,
                    **{k: d[k] for k in READING_FIELDS if k in d}}
             docs.append(doc)
-            key = f'{d["cow_id"]}|{ts.isoformat(timespec="milliseconds")}'   # same reading twice = stored once
+            key = f'{d["rfid"]}|{ts.isoformat(timespec="milliseconds")}'   # same reading twice = stored once
             keys.append(key)
             ops.append(UpdateOne({"_id": key}, {"$setOnInsert": doc}, upsert=True))
         result = await cols.realtime.bulk_write(ops, ordered=False)
@@ -149,7 +162,7 @@ async def handle_realtime(message: aio_pika.abc.AbstractIncomingMessage, cols: C
         return
 
     for doc in docs:
-        await hub.broadcast(cols, doc["cow_id"], {"type": "update", "cow_id": doc["cow_id"], "data": doc})
+        await hub.broadcast(cols, doc["rfid"], {"type": "update", "cow_id": doc["cow_id"], "data": doc})
 
 
 async def handle_dispatch(message: aio_pika.abc.AbstractIncomingMessage, cols: Cols):

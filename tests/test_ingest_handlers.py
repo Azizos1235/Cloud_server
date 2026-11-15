@@ -26,6 +26,12 @@ class IngestHandlerTests(unittest.IsolatedAsyncioTestCase):
     def make_collection(self, name, bulk_write):
         return SimpleNamespace(name=name, bulk_write=bulk_write)
 
+    def make_profiles(self, profile=None):
+        return SimpleNamespace(find_one=AsyncMock(return_value=profile or {
+            "_id": "COW123",
+            "cow_id": "COW001",
+        }))
+
     async def test_daily_ack_follows_successful_upsert_and_logs_identity(self):
         events = []
 
@@ -44,7 +50,8 @@ class IngestHandlerTests(unittest.IsolatedAsyncioTestCase):
         })
         message.ack.side_effect = acknowledge
         cols = SimpleNamespace(
-            daily=self.make_collection("daily_summaries", AsyncMock(side_effect=write))
+            daily=self.make_collection("daily_summaries", AsyncMock(side_effect=write)),
+            profiles=self.make_profiles(),
         )
 
         with self.assertLogs("ingest", level="INFO") as logs:
@@ -81,7 +88,8 @@ class IngestHandlerTests(unittest.IsolatedAsyncioTestCase):
         })
         message.ack.side_effect = acknowledge
         cols = SimpleNamespace(
-            realtime=self.make_collection("realtime_readings", AsyncMock(side_effect=write))
+            realtime=self.make_collection("realtime_readings", AsyncMock(side_effect=write)),
+            profiles=self.make_profiles(),
         )
 
         with patch("app.ingest.handlers.hub.broadcast", new_callable=AsyncMock):
@@ -105,7 +113,8 @@ class IngestHandlerTests(unittest.IsolatedAsyncioTestCase):
             daily=self.make_collection(
                 "daily_summaries",
                 AsyncMock(side_effect=WriteError("validation failed", code=121)),
-            )
+            ),
+            profiles=self.make_profiles(),
         )
 
         with self.assertLogs("ingest", level="ERROR") as logs:
@@ -131,7 +140,8 @@ class IngestHandlerTests(unittest.IsolatedAsyncioTestCase):
             "nUpserted": 0,
         })
         cols = SimpleNamespace(
-            daily=self.make_collection("daily_summaries", AsyncMock(side_effect=bulk_error))
+            daily=self.make_collection("daily_summaries", AsyncMock(side_effect=bulk_error)),
+            profiles=self.make_profiles(),
         )
 
         with self.assertLogs("ingest", level="ERROR") as logs:
@@ -151,7 +161,8 @@ class IngestHandlerTests(unittest.IsolatedAsyncioTestCase):
             daily=self.make_collection(
                 "daily_summaries",
                 AsyncMock(side_effect=RuntimeError("database unavailable")),
-            )
+            ),
+            profiles=self.make_profiles(),
         )
 
         with patch("app.ingest.handlers.asyncio.sleep", new_callable=AsyncMock):
@@ -168,7 +179,10 @@ class IngestHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_malformed_json_is_logged_and_rejected(self):
         message = self.make_message({})
         message.body = b"{not-json"
-        cols = SimpleNamespace(daily=self.make_collection("daily_summaries", AsyncMock()))
+        cols = SimpleNamespace(
+            daily=self.make_collection("daily_summaries", AsyncMock()),
+            profiles=self.make_profiles(),
+        )
 
         with self.assertLogs("ingest", level="ERROR") as logs:
             await handle_daily(message, cols)
@@ -182,7 +196,10 @@ class IngestHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_json_list_is_rejected_without_a_database_write(self):
         message = self.make_message({})
         message.body = b"[]"
-        cols = SimpleNamespace(daily=self.make_collection("daily_summaries", AsyncMock()))
+        cols = SimpleNamespace(
+            daily=self.make_collection("daily_summaries", AsyncMock()),
+            profiles=self.make_profiles(),
+        )
 
         with self.assertLogs("ingest", level="ERROR"):
             await handle_daily(message, cols)
@@ -198,7 +215,8 @@ class IngestHandlerTests(unittest.IsolatedAsyncioTestCase):
             "received_at": "not-a-timestamp",
         })
         cols = SimpleNamespace(
-            realtime=self.make_collection("realtime_readings", AsyncMock())
+            realtime=self.make_collection("realtime_readings", AsyncMock()),
+            profiles=self.make_profiles(),
         )
 
         with self.assertLogs("ingest", level="ERROR") as logs:
@@ -209,6 +227,33 @@ class IngestHandlerTests(unittest.IsolatedAsyncioTestCase):
         message.reject.assert_awaited_once_with(requeue=False)
         message.ack.assert_not_awaited()
         cols.realtime.bulk_write.assert_not_awaited()
+
+    async def test_unresolved_daily_rfid_is_saved_with_null_cow_id(self):
+        operations = []
+
+        async def write(ops, ordered):
+            operations.extend(ops)
+            return SimpleNamespace(upserted_ids={0: "99887766-2026-11-14"})
+
+        message = self.make_message({
+            "cow_id": " 99887766 ",
+            "date": "2026-11-14",
+        })
+        cols = SimpleNamespace(
+            daily=self.make_collection("daily_summaries", AsyncMock(side_effect=write)),
+            profiles=SimpleNamespace(find_one=AsyncMock(return_value=None)),
+        )
+
+        with self.assertLogs("ingest", level="WARNING") as logs:
+            await handle_daily(message, cols)
+
+        update = operations[0]._doc[0]["$set"]
+        self.assertEqual(operations[0]._filter, {"_id": "99887766-2026-11-14"})
+        self.assertIsNone(update["cow_id"])
+        self.assertEqual(update["rfid"], "99887766")
+        self.assertTrue(any("No cow profile for RFID 99887766" in line for line in logs.output))
+        message.ack.assert_awaited_once()
+        message.nack.assert_not_awaited()
 
 
 if __name__ == "__main__":

@@ -50,13 +50,20 @@ async def ensure_index(cols: Cols):
             await cols.eleveurs.drop_index(index["name"])
     await _ensure_pending_request_email_index(cols.subscription_requests)
 
+    async for index in await cols.daily.list_indexes():
+        if (index.get("unique")
+                and list(index.get("key", {}).items()) == [("cow_id", 1), ("date", -1)]):
+            await cols.daily.drop_index(index["name"])
+
     specs = [
         (cols.admins,   [("email", 1)], {"unique": True}),
         (cols.superusers, [("email", 1)], {"unique": True}),
         (cols.invites, [("code_hash", 1)], {"unique": True}),
         (cols.invites, [("admin_id", 1)], {}),
         (cols.subscription_requests, [("status", 1), ("created_at", -1)], {}),
-        (cols.daily,    [("cow_id", 1), ("date", -1)], {"unique": True}),       # one summary per cow per day
+        (cols.daily,    [("cow_id", 1), ("date", -1)], {}),
+        (cols.daily,    [("rfid", 1), ("date", -1)],
+         {"unique": True, "partialFilterExpression": {"rfid": {"$type": "string"}}}),
         (cols.realtime, [("cow_id", 1), ("timestamp", -1)], {}),
         (cols.dispatch, [("cow_id", 1), ("date", 1)], {"unique": True}),
         (cols.profiles, [("admin_id", 1)], {}),
@@ -87,7 +94,13 @@ async def adopt_orphans(cols: Cols, default_admin_id):
     })
     async for alert in cursor:
         cow = await cols.profiles.find_one(
-            {"_id": alert["cow_id"], "admin_id": {"$exists": True}},
+            {
+                "$or": [
+                    {"_id": alert["cow_id"]},
+                    {"cow_id": alert["cow_id"]},
+                ],
+                "admin_id": {"$exists": True},
+            },
             {"admin_id": 1},
         )
         if cow and cow.get("admin_id") is not None:
