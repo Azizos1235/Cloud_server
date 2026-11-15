@@ -6,7 +6,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.config import settings
-from app.cow_ids import cow_data_filter
+from app.cow_ids import cow_data_filter, normalize_cow_identifier
 from app.deps import admin_only, get_actor, owned_cow, owner_filter
 from app.jobs.appetite import run_for_day
 from app.services.ai import predict
@@ -14,6 +14,34 @@ from app.utils import age_months, latest
 
 log = logging.getLogger("ingest")
 router = APIRouter()
+MAX_HOME_APPETITE_COWS = 500
+_APPETITE_CLASS_ALIASES = {
+    "low": "decreasing",
+    "decreasing": "decreasing",
+    "normal": "stable",
+    "stable": "stable",
+    "high": "increasing",
+    "increasing": "increasing",
+}
+
+
+def _home_appetite_class(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    return _APPETITE_CLASS_ALIASES.get(value.strip().lower())
+
+
+def _home_appetite_date(value: object) -> Optional[str]:
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, Date):
+        return value.isoformat()
+    if isinstance(value, str):
+        try:
+            return Date.fromisoformat(value[:10]).isoformat()
+        except ValueError:
+            return None
+    return None
 
 
 @router.get("/health")
@@ -32,6 +60,113 @@ async def cows(request: Request, actor: dict = Depends(get_actor)):
             for p in profiles
         ],
     }
+
+
+@router.get("/home/appetite")
+async def home_appetite(request: Request, actor: dict = Depends(get_actor)):
+    cols = request.app.state.cols
+    profiles_cursor = (
+        cols.profiles.find(
+            owner_filter(actor),
+            {"_id": 1, "cow_id": 1},
+        )
+        .sort("_id", 1)
+        .limit(MAX_HOME_APPETITE_COWS + 1)
+    )
+    profiles = [profile async for profile in profiles_cursor]
+    if len(profiles) > MAX_HOME_APPETITE_COWS:
+        raise HTTPException(
+            413,
+            f"Home appetite is limited to {MAX_HOME_APPETITE_COWS} cows",
+        )
+
+    appetite_by_internal_id = {}
+    identifiers_to_internal_ids = {}
+    rfid_to_internal_id = {}
+    for profile in profiles:
+        if profile.get("_id") is None:
+            continue
+        internal_id = str(profile["_id"])
+        rfid = normalize_cow_identifier(internal_id)
+        raw_cow_id = profile.get("cow_id")
+        cow_id = (
+            normalize_cow_identifier(raw_cow_id)
+            if isinstance(raw_cow_id, str) and raw_cow_id.strip()
+            else None
+        )
+        appetite_by_internal_id[internal_id] = {
+            "cow_id": cow_id,
+            "appetite": None,
+            "date": None,
+        }
+        rfid_to_internal_id[rfid] = internal_id
+        for identifier in (rfid, cow_id):
+            if identifier:
+                identifiers_to_internal_ids.setdefault(
+                    identifier, set()
+                ).add(internal_id)
+
+    if not appetite_by_internal_id:
+        return {"appetite": appetite_by_internal_id}
+
+    unambiguous_identifiers = {
+        identifier: next(iter(internal_ids))
+        for identifier, internal_ids in identifiers_to_internal_ids.items()
+        if len(internal_ids) == 1
+    }
+    identifiers = sorted(identifiers_to_internal_ids)
+    rfids = sorted(rfid_to_internal_id)
+    pipeline = [
+        {
+            "$match": {
+                "$or": [
+                    {"cow_id": {"$in": identifiers}},
+                    {"rfid": {"$in": rfids}},
+                ]
+            }
+        },
+        {"$sort": {"date": -1, "_id": 1}},
+        {
+            "$group": {
+                "_id": {"$ifNull": ["$rfid", "$cow_id"]},
+                "record": {"$first": "$$ROOT"},
+            }
+        },
+        {"$sort": {"record.date": -1, "record._id": 1}},
+        {
+            "$project": {
+                "_id": 1,
+                "rfid": "$record.rfid",
+                "date": "$record.date",
+                "appetite_class": "$record.appetite_class",
+            }
+        },
+    ]
+    latest_by_internal_id = {}
+    async for record in cols.daily.aggregate(pipeline):
+        raw_rfid = record.get("rfid")
+        internal_id = (
+            rfid_to_internal_id.get(normalize_cow_identifier(raw_rfid))
+            if isinstance(raw_rfid, str) and raw_rfid.strip()
+            else None
+        )
+        if internal_id is None:
+            raw_identifier = record.get("_id")
+            if raw_identifier is not None:
+                internal_id = unambiguous_identifiers.get(
+                    normalize_cow_identifier(str(raw_identifier))
+                )
+        if internal_id is None or internal_id in latest_by_internal_id:
+            continue
+        latest_by_internal_id[internal_id] = record
+
+    for internal_id, record in latest_by_internal_id.items():
+        appetite_by_internal_id[internal_id].update(
+            appetite=_home_appetite_class(record.get("appetite_class")),
+            date=_home_appetite_date(record.get("date")),
+        )
+
+    return {"appetite": appetite_by_internal_id}
 
 
 @router.get("/latest/{cow_id}")
