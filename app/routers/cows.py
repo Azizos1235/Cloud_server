@@ -20,6 +20,7 @@ from app.utils import age_months, latest
 log = logging.getLogger("ingest")
 router = APIRouter()
 MAX_HOME_APPETITE_COWS = 500
+MAX_HOME_APPETITE_VARIANTS = 25_000
 _APPETITE_CLASS_ALIASES = {
     "low": "decreasing",
     "decreased": "decreasing",
@@ -55,77 +56,75 @@ def _home_appetite_class(value: object) -> Optional[str]:
 def _home_cow_id(value: object) -> str:
     if value is None:
         return ""
-    return re.sub(r"[\s_-]+", "", str(value)).casefold()
+    return re.sub(r"[-_]", "", str(value).strip()).upper()
 
 
-def _mongo_home_cow_id(field: str = "$cow_id"):
+def _home_identifier_variants(value: object) -> set[str]:
+    raw = str(value).strip() if value is not None else ""
+    compact = re.sub(r"[-_]", "", raw)
+    variants = set()
+    for candidate in (raw, compact):
+        if candidate:
+            variants.update((candidate, candidate.upper(), candidate.lower()))
+
+    boundaries = [
+        index
+        for index in range(1, len(compact))
+        if compact[index - 1].isalnum()
+        and compact[index].isalnum()
+        and compact[index - 1].isalpha() != compact[index].isalpha()
+    ]
+    for separator in ("-", "_"):
+        separated = "".join(
+            (separator if index in boundaries else "") + character
+            for index, character in enumerate(compact)
+        )
+        if separated:
+            variants.update(
+                (separated, separated.upper(), separated.lower())
+            )
+    return variants
+
+
+def _home_identifier_match(variants: list[str]) -> dict:
     return {
-        "$toLower": {
-            "$regexReplace": {
-                "input": {
-                    "$convert": {
-                        "input": field,
-                        "to": "string",
-                        "onError": "",
-                        "onNull": "",
-                    }
-                },
-                "regex": r"[\s_-]+",
-                "replacement": "",
-            }
-        }
-    }
-
-
-def _mongo_home_profile_match(identifiers: list[str]) -> dict:
-    return {
-        "$expr": {
-            "$or": [
-                {"$in": [_mongo_home_cow_id("$cow_id"), identifiers]},
-                {"$in": [_mongo_home_cow_id("$rfid"), identifiers]},
-            ]
-        }
+        "$or": [
+            {"cow_id": {"$in": variants}},
+            {"rfid": {"$in": variants}},
+        ]
     }
 
 
 def _home_appetite_match_conditions():
     return [
-        {"appetite_class": {"$type": "string", "$regex": r"\S"}},
-        {"appetite.category": {"$type": "string", "$regex": r"\S"}},
-        {"appetite.status": {"$type": "string", "$regex": r"\S"}},
+        {"appetite_class": {"$type": "string", "$ne": ""}},
+        {"appetite.category": {"$type": "string", "$ne": ""}},
+        {"appetite.status": {"$type": "string", "$ne": ""}},
         {"appetite_pct": {"$exists": True}},
         {"appetite.percentages": {"$exists": True}},
     ]
 
 
-def _home_daily_pipeline(identifiers: list[str], require_appetite: bool) -> list[dict]:
-    match = _mongo_home_profile_match(identifiers)
+def _home_daily_pipeline(variants: list[str], require_appetite: bool) -> list[dict]:
+    conditions = [_home_identifier_match(variants)]
     if require_appetite:
-        match["$or"] = _home_appetite_match_conditions()
-    normalized_cow_id = _mongo_home_cow_id("$cow_id")
-    normalized_rfid = _mongo_home_cow_id("$rfid")
+        conditions.append({"$or": _home_appetite_match_conditions()})
     return [
-        {"$match": match},
+        {"$match": {"$and": conditions}},
         {"$sort": {"date": -1}},
         {
             "$group": {
-                "_id": {
-                    "$cond": [
-                        {"$in": [normalized_cow_id, identifiers]},
-                        normalized_cow_id,
-                        normalized_rfid,
-                    ]
-                },
+                "_id": {"cow": "$cow_id", "rfid": "$rfid"},
                 "doc": {"$first": "$$ROOT"},
             }
         },
-        {"$sort": {"doc.date": -1, "doc._id": 1}},
     ]
 
 
-def _home_profiles_index(profiles: list[dict]) -> tuple[dict, dict]:
+def _home_profiles_index(profiles: list[dict]) -> tuple[dict, dict, list[str]]:
     by_internal_id = {}
     owners_by_identifier = {}
+    variants = set()
     for profile in profiles:
         if profile.get("_id") is None:
             continue
@@ -152,12 +151,57 @@ def _home_profiles_index(profiles: list[dict]) -> tuple[dict, dict]:
             identifier = _home_cow_id(value)
             if identifier:
                 owners_by_identifier.setdefault(identifier, set()).add(internal_id)
+                variants.update(_home_identifier_variants(value))
     internal_by_identifier = {
         identifier: next(iter(internal_ids))
         for identifier, internal_ids in owners_by_identifier.items()
         if len(internal_ids) == 1
     }
-    return by_internal_id, internal_by_identifier
+    return (
+        by_internal_id,
+        internal_by_identifier,
+        sorted(variants)[:MAX_HOME_APPETITE_VARIANTS],
+    )
+
+
+def _home_profile_for_record(record: dict, internal_by_identifier: dict) -> Optional[str]:
+    matches = {
+        internal_by_identifier.get(_home_cow_id(record.get(field)))
+        for field in ("cow_id", "rfid")
+    }
+    matches.discard(None)
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+def _home_record_datetime(value: object) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, Date):
+        parsed = datetime.combine(value, datetime.min.time())
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                parsed = datetime.combine(Date.fromisoformat(value[:10]), datetime.min.time())
+            except ValueError:
+                return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _home_record_is_newer(candidate: dict, previous: Optional[dict]) -> bool:
+    if previous is None:
+        return True
+    candidate_date = _home_record_datetime(candidate.get("date"))
+    previous_date = _home_record_datetime(previous.get("date"))
+    return (
+        candidate_date is not None
+        and (previous_date is None or candidate_date > previous_date)
+    )
 
 
 def _largest_appetite_percentage(value: object) -> Optional[str]:
@@ -279,23 +323,30 @@ async def home_appetite(request: Request, actor: dict = Depends(get_actor)):
             f"Home appetite is limited to {MAX_HOME_APPETITE_COWS} cows",
         )
 
-    appetite_by_internal_id, internal_by_identifier = _home_profiles_index(profiles)
-    identifiers = sorted(internal_by_identifier)
-    if not identifiers:
+    appetite_by_internal_id, internal_by_identifier, variants = _home_profiles_index(
+        profiles
+    )
+    if not variants:
         return _home_json_value({"appetite": appetite_by_internal_id})
 
-    pipeline = _home_daily_pipeline(identifiers, require_appetite=True)
+    pipeline = _home_daily_pipeline(variants, require_appetite=True)
     cursor = await cols.daily.aggregate(pipeline)
+    selected_by_internal_id = {}
     async for grouped in cursor:
-        internal_id = internal_by_identifier.get(grouped.get("_id"))
         record = grouped.get("doc")
-        if (
-            internal_id is None
-            or internal_id not in appetite_by_internal_id
-            or record is None
-            or appetite_by_internal_id[internal_id]["date"] is not None
+        if record is None:
+            continue
+        internal_id = _home_profile_for_record(record, internal_by_identifier)
+        if internal_id is None or internal_id not in appetite_by_internal_id:
+            continue
+        _, source, _ = _resolve_home_appetite(record)
+        if source is None or not _home_record_is_newer(
+            record, selected_by_internal_id.get(internal_id)
         ):
             continue
+        selected_by_internal_id[internal_id] = record
+
+    for internal_id, record in selected_by_internal_id.items():
         result, source, raw = _resolve_home_appetite(record)
         appetite_by_internal_id[internal_id].update(
             appetite=result,
@@ -307,7 +358,6 @@ async def home_appetite(request: Request, actor: dict = Depends(get_actor)):
     return _home_json_value({"appetite": appetite_by_internal_id})
 
 
-@router.get("/home/appetite/debug")
 async def _home_appetite_debug_response(request: Request, actor: dict) -> dict:
     cols = request.app.state.cols
     cursor = (
@@ -325,11 +375,9 @@ async def _home_appetite_debug_response(request: Request, actor: dict) -> dict:
             f"Home appetite debug is limited to {MAX_HOME_APPETITE_COWS} cows",
         )
     profiles = owned_profiles[:10]
-    _, internal_by_identifier = _home_profiles_index(profiles)
-    identifiers = sorted(internal_by_identifier)
-    _, all_owned_identifiers = _home_profiles_index(owned_profiles)
-    stats_identifiers = sorted(all_owned_identifiers)
-    if not identifiers or not stats_identifiers:
+    _, internal_by_identifier, variants = _home_profiles_index(profiles)
+    _, _, stats_variants = _home_profiles_index(owned_profiles)
+    if not variants or not stats_variants:
         return {
             "cows": [
                 {
@@ -350,28 +398,39 @@ async def _home_appetite_debug_response(request: Request, actor: dict) -> dict:
 
     newest_by_internal_id = {}
     newest_cursor = await cols.daily.aggregate(
-        _home_daily_pipeline(identifiers, require_appetite=False)
+        _home_daily_pipeline(variants, require_appetite=False)
     )
     async for grouped in newest_cursor:
-        internal_id = internal_by_identifier.get(grouped.get("_id"))
         record = grouped.get("doc")
-        if internal_id is not None and record is not None:
-            newest_by_internal_id.setdefault(internal_id, record)
+        if record is None:
+            continue
+        internal_id = _home_profile_for_record(record, internal_by_identifier)
+        if internal_id is not None and _home_record_is_newer(
+            record, newest_by_internal_id.get(internal_id)
+        ):
+            newest_by_internal_id[internal_id] = record
 
     chosen_by_internal_id = {}
     chosen_cursor = await cols.daily.aggregate(
-        _home_daily_pipeline(identifiers, require_appetite=True)
+        _home_daily_pipeline(variants, require_appetite=True)
     )
     async for grouped in chosen_cursor:
-        internal_id = internal_by_identifier.get(grouped.get("_id"))
         record = grouped.get("doc")
-        if internal_id is not None and record is not None:
-            chosen_by_internal_id.setdefault(internal_id, record)
+        if record is None:
+            continue
+        internal_id = _home_profile_for_record(record, internal_by_identifier)
+        if internal_id is None:
+            continue
+        _, source, _ = _resolve_home_appetite(record)
+        if source is not None and _home_record_is_newer(
+            record, chosen_by_internal_id.get(internal_id)
+        ):
+            chosen_by_internal_id[internal_id] = record
 
     appetite_class_match = {"appetite_class": {"$exists": True}}
-    raw_label_match = {"appetite_class": {"$type": "string", "$regex": r"\S"}}
+    raw_label_match = {"appetite_class": {"$type": "string", "$ne": ""}}
     stats_pipeline = [
-        {"$match": _mongo_home_profile_match(stats_identifiers)},
+        {"$match": {"$and": [_home_identifier_match(stats_variants)]}},
         {
             "$facet": {
                 "total": [

@@ -11,7 +11,7 @@ from bson import ObjectId
 os.environ.setdefault("JWT_SECRET", secrets.token_urlsafe(32))
 
 from app.deps import owner_filter
-from app.routers.cows import home_appetite, home_appetite_debug
+from app.routers.cows import home_appetite, home_appetite_debug, router
 
 
 class AsyncCursor:
@@ -38,7 +38,19 @@ class AsyncCursor:
 
 
 def _normalized_cow_id(value):
-    return re.sub(r"[\s_-]+", "", str(value)).casefold()
+    return re.sub(r"[-_]", "", str(value).strip()).upper()
+
+
+def _pipeline_strings(value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield key
+            yield from _pipeline_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _pipeline_strings(item)
+    elif isinstance(value, str):
+        yield value
 
 
 def _has_appetite(record):
@@ -65,14 +77,14 @@ class FakeDailyCollection:
     async def aggregate(self, pipeline):
         self.pipelines.append(pipeline)
         match = pipeline[0]["$match"]
-        expressions = match["$expr"].get("$or", [])
-        identifiers = expressions[0]["$in"][1] if expressions else []
+        conditions = match["$and"]
+        identifier_match = conditions[0]["$or"]
+        variants = identifier_match[0]["cow_id"]["$in"]
         if "$facet" in pipeline[1]:
             matched = [
                 record
                 for record in self.records
-                if _normalized_cow_id(record.get("cow_id")) in identifiers
-                or _normalized_cow_id(record.get("rfid")) in identifiers
+                if record.get("cow_id") in variants or record.get("rfid") in variants
             ]
             labels = {}
             for record in matched:
@@ -94,37 +106,43 @@ class FakeDailyCollection:
             }
             return AsyncCursor([stats])
 
-        require_appetite = "$or" in match
+        require_appetite = len(conditions) > 1
         records = [
             record
             for record in self.records
             if (
-                _normalized_cow_id(record.get("cow_id")) in identifiers
-                or _normalized_cow_id(record.get("rfid")) in identifiers
+                record.get("cow_id") in variants
+                or record.get("rfid") in variants
             )
             and (not require_appetite or _has_appetite(record))
         ]
         records.sort(key=lambda record: record["date"], reverse=True)
 
-        latest_by_cow = {}
+        latest_by_identifiers = {}
         for record in records:
-            cow_id = _normalized_cow_id(record.get("cow_id"))
-            identifier = (
-                cow_id
-                if cow_id in identifiers
-                else _normalized_cow_id(record.get("rfid"))
-            )
-            latest_by_cow.setdefault(identifier, record)
+            identifier_pair = (record.get("cow_id"), record.get("rfid"))
+            latest_by_identifiers.setdefault(identifier_pair, record)
 
         grouped = [
-            {"_id": identifier, "doc": record}
-            for identifier, record in latest_by_cow.items()
+            {
+                "_id": {"cow": identifier_pair[0], "rfid": identifier_pair[1]},
+                "doc": record,
+            }
+            for identifier_pair, record in latest_by_identifiers.items()
         ]
-        grouped.sort(key=lambda item: item["doc"]["date"], reverse=True)
         return AsyncCursor(grouped)
 
 
 class HomeAppetiteEndpointTests(unittest.IsolatedAsyncioTestCase):
+    def test_debug_route_is_registered_once(self):
+        routes = [
+            route
+            for route in router.routes
+            if getattr(route, "path", None) == "/home/appetite/debug"
+        ]
+
+        self.assertEqual(len(routes), 1)
+
     async def test_admin_and_eleveur_match_profile_aliases_and_return_json_safe_data(self):
         profile_id = ObjectId()
         profile = {
@@ -216,6 +234,78 @@ class HomeAppetiteEndpointTests(unittest.IsolatedAsyncioTestCase):
                     str(older_with_appetite["appetite"]["source_id"]), serialized
                 )
                 self.assertIn('"low": null', serialized)
+                for pipeline in daily.pipelines:
+                    forbidden = {
+                        "$regexReplace",
+                        "$replaceAll",
+                        "$regex",
+                        "$toLower",
+                        "$toUpper",
+                    }
+                    self.assertFalse(
+                        any(
+                            token in value
+                            for value in _pipeline_strings(pipeline)
+                            for token in forbidden
+                        ),
+                        msg=f"Unsupported string operator in pipeline: {pipeline!r}",
+                    )
+
+    async def test_cow_and_rfid_spellings_match_and_latest_date_wins(self):
+        profile = {"_id": "RFID-01", "cow_id": "COW001", "rfid": "RFID-01"}
+        daily = FakeDailyCollection(
+            [
+                {
+                    "_id": "dash-cow-id",
+                    "cow_id": "COW-001",
+                    "date": datetime(2026, 11, 16, tzinfo=timezone.utc),
+                    "appetite_class": "low",
+                },
+                {
+                    "_id": "lower-cow-id",
+                    "cow_id": "cow001",
+                    "date": datetime(2026, 11, 17, tzinfo=timezone.utc),
+                    "appetite_class": "normal",
+                },
+                {
+                    "_id": "rfid-spelling",
+                    "cow_id": "legacy-id",
+                    "rfid": "rfid_01",
+                    "date": datetime(2026, 11, 18, tzinfo=timezone.utc),
+                    "appetite_class": "high",
+                },
+            ]
+        )
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    cols=SimpleNamespace(
+                        profiles=SimpleNamespace(
+                            find=lambda *_args: AsyncCursor([profile])
+                        ),
+                        daily=daily,
+                    )
+                )
+            )
+        )
+
+        response = await home_appetite(request, {"admin_id": "admin-1"})
+
+        self.assertEqual(
+            response["appetite"]["RFID-01"],
+            {
+                "cow_id": "COW001",
+                "appetite": "increasing",
+                "source": "appetite_class",
+                "raw": "high",
+                "date": "2026-11-18",
+            },
+        )
+        variants = daily.pipelines[0][0]["$match"]["$and"][0]["$or"][0]["cow_id"][
+            "$in"
+        ]
+        self.assertTrue({"COW001", "COW-001", "COW_001", "cow001"} <= set(variants))
+        self.assertTrue({"RFID-01", "RFID01", "RFID_01", "rfid_01"} <= set(variants))
 
     async def test_latest_record_with_appetite_and_all_supported_sources(self):
         profiles = [
@@ -229,7 +319,7 @@ class HomeAppetiteEndpointTests(unittest.IsolatedAsyncioTestCase):
             [
                 {
                     "_id": "newest-COW001",
-                    "cow_id": "cow 001",
+                    "cow_id": "cow001",
                     "date": datetime(2026, 11, 15, tzinfo=timezone.utc),
                 },
                 {
@@ -311,8 +401,13 @@ class HomeAppetiteEndpointTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(profile_find_calls[0][0], owner_filter(actor))
         pipeline = daily.pipelines[0]
-        self.assertIn("$or", pipeline[0]["$match"])
+        self.assertIn("$and", pipeline[0]["$match"])
+        self.assertEqual(len(pipeline), 3)
         self.assertEqual(pipeline[1], {"$sort": {"date": -1}})
+        self.assertEqual(
+            pipeline[2]["$group"]["_id"],
+            {"cow": "$cow_id", "rfid": "$rfid"},
+        )
         self.assertIn("$first", pipeline[2]["$group"]["doc"])
 
     async def test_status_and_substring_labels_map_case_insensitively(self):
