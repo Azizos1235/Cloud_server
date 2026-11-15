@@ -1,5 +1,7 @@
 """Cows: what the Flutter CowService calls (all scoped to the caller)."""
 import logging
+import math
+import re
 from datetime import date as Date, datetime, timezone
 from typing import Optional
 
@@ -17,11 +19,15 @@ router = APIRouter()
 MAX_HOME_APPETITE_COWS = 500
 _APPETITE_CLASS_ALIASES = {
     "low": "decreasing",
+    "decreased": "decreasing",
     "decreasing": "decreasing",
+    "decrease": "decreasing",
     "normal": "stable",
     "stable": "stable",
     "high": "increasing",
+    "increased": "increasing",
     "increasing": "increasing",
+    "increase": "increasing",
 }
 
 
@@ -34,26 +40,160 @@ def _home_appetite_class(value: object) -> Optional[str]:
     exact_match = _APPETITE_CLASS_ALIASES.get(label)
     if exact_match is not None:
         return exact_match
-    for aliases, appetite in (
-        (("decreasing", "low"), "decreasing"),
-        (("stable", "normal"), "stable"),
-        (("increasing", "high"), "increasing"),
-    ):
-        if any(alias in label for alias in aliases):
-            return appetite
+    if any(alias in label for alias in ("low", "decreased", "decreasing", "decrease")):
+        return "decreasing"
+    if any(alias in label for alias in ("normal", "stable")):
+        return "stable"
+    if any(alias in label for alias in ("high", "increased", "increasing", "increase")):
+        return "increasing"
     return None
 
 
-def _home_appetite_raw(record: dict) -> Optional[str]:
-    appetite_class = record.get("appetite_class")
-    if isinstance(appetite_class, str) and appetite_class.strip():
-        return appetite_class
+def _home_cow_id(value: object) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"[\s_-]+", "", str(value)).casefold()
+
+
+def _mongo_home_cow_id():
+    return {
+        "$toLower": {
+            "$regexReplace": {
+                "input": {
+                    "$convert": {
+                        "input": "$cow_id",
+                        "to": "string",
+                        "onError": "",
+                        "onNull": "",
+                    }
+                },
+                "regex": r"[\s_-]+",
+                "replacement": "",
+            }
+        }
+    }
+
+
+def _home_appetite_match_conditions():
+    return [
+        {"appetite_class": {"$type": "string", "$regex": r"\S"}},
+        {"appetite.category": {"$type": "string", "$regex": r"\S"}},
+        {"appetite.status": {"$type": "string", "$regex": r"\S"}},
+        {"appetite_pct": {"$exists": True}},
+        {"appetite.percentages": {"$exists": True}},
+    ]
+
+
+def _home_daily_pipeline(identifiers: list[str], require_appetite: bool) -> list[dict]:
+    match = {"$expr": {"$in": [_mongo_home_cow_id(), identifiers]}}
+    if require_appetite:
+        match["$or"] = _home_appetite_match_conditions()
+    normalized_cow_id = _mongo_home_cow_id()
+    return [
+        {"$match": match},
+        {"$sort": {"date": -1}},
+        {
+            "$group": {
+                "_id": normalized_cow_id,
+                "doc": {"$first": "$$ROOT"},
+            }
+        },
+        {"$sort": {"doc.date": -1, "doc._id": 1}},
+    ]
+
+
+def _home_profiles_index(profiles: list[dict]) -> tuple[dict, dict]:
+    by_internal_id = {}
+    owners_by_identifier = {}
+    for profile in profiles:
+        if profile.get("_id") is None:
+            continue
+        internal_id = str(profile["_id"])
+        raw_cow_id = profile.get("cow_id")
+        cow_id = (
+            normalize_cow_identifier(raw_cow_id)
+            if isinstance(raw_cow_id, str) and raw_cow_id.strip()
+            else None
+        )
+        by_internal_id[internal_id] = {
+            "cow_id": cow_id,
+            "appetite": None,
+            "source": None,
+            "raw": None,
+            "date": None,
+        }
+        for value in (profile["_id"], raw_cow_id):
+            identifier = _home_cow_id(value)
+            if identifier:
+                owners_by_identifier.setdefault(identifier, set()).add(internal_id)
+    internal_by_identifier = {
+        identifier: next(iter(internal_ids))
+        for identifier, internal_ids in owners_by_identifier.items()
+        if len(internal_ids) == 1
+    }
+    return by_internal_id, internal_by_identifier
+
+
+def _largest_appetite_percentage(value: object) -> Optional[str]:
+    if not isinstance(value, dict):
+        return None
+    candidates = []
+    for raw_label, raw_percent in value.items():
+        appetite = _home_appetite_class(raw_label)
+        if appetite is None or isinstance(raw_percent, bool):
+            continue
+        try:
+            percent = float(raw_percent)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(percent):
+            candidates.append((percent, appetite))
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def _resolve_home_appetite(record: dict) -> tuple[Optional[str], Optional[str], object]:
     appetite = record.get("appetite")
-    if isinstance(appetite, dict):
-        category = appetite.get("category")
-        if isinstance(category, str):
-            return category
-    return appetite_class if isinstance(appetite_class, str) else None
+    nested = appetite if isinstance(appetite, dict) else {}
+    for source, raw in (
+        ("appetite_class", record.get("appetite_class")),
+        ("appetite.category", nested.get("category")),
+        ("appetite.status", nested.get("status")),
+    ):
+        if isinstance(raw, str) and raw.strip():
+            return _home_appetite_class(raw), source, raw
+
+    for source, raw in (
+        ("appetite_pct", record.get("appetite_pct")),
+        ("appetite.percentages", nested.get("percentages")),
+    ):
+        selected = _largest_appetite_percentage(raw)
+        if selected is not None:
+            return selected, source, raw
+    return None, None, None
+
+
+def _home_json_value(value: object):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Date):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _home_json_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_home_json_value(item) for item in value]
+    return value
+
+
+def _home_daily_appetite_fields(record: dict) -> dict:
+    return {
+        "date": _home_appetite_date(record.get("date")),
+        "appetite_class": _home_json_value(record.get("appetite_class")),
+        "appetite": _home_json_value(record.get("appetite")),
+        "appetite_pct": _home_json_value(record.get("appetite_pct")),
+        "appetite_computed_at": _home_json_value(
+            record.get("appetite_computed_at")
+        ),
+    }
 
 
 def _home_appetite_date(value: object) -> Optional[str]:
@@ -105,96 +245,141 @@ async def home_appetite(request: Request, actor: dict = Depends(get_actor)):
             f"Home appetite is limited to {MAX_HOME_APPETITE_COWS} cows",
         )
 
-    appetite_by_internal_id = {}
-    identifiers_to_internal_ids = {}
-    rfid_to_internal_id = {}
-    for profile in profiles:
-        if profile.get("_id") is None:
-            continue
-        internal_id = str(profile["_id"])
-        rfid = normalize_cow_identifier(internal_id)
-        raw_cow_id = profile.get("cow_id")
-        cow_id = (
-            normalize_cow_identifier(raw_cow_id)
-            if isinstance(raw_cow_id, str) and raw_cow_id.strip()
-            else None
-        )
-        appetite_by_internal_id[internal_id] = {
-            "cow_id": cow_id,
-            "appetite": None,
-            "raw": None,
-            "date": None,
-        }
-        rfid_to_internal_id[rfid] = internal_id
-        for identifier in (rfid, cow_id):
-            if identifier:
-                identifiers_to_internal_ids.setdefault(
-                    identifier, set()
-                ).add(internal_id)
-
-    if not appetite_by_internal_id:
+    appetite_by_internal_id, internal_by_identifier = _home_profiles_index(profiles)
+    identifiers = sorted(internal_by_identifier)
+    if not identifiers:
         return {"appetite": appetite_by_internal_id}
 
-    unambiguous_identifiers = {
-        identifier: next(iter(internal_ids))
-        for identifier, internal_ids in identifiers_to_internal_ids.items()
-        if len(internal_ids) == 1
-    }
-    identifiers = sorted(identifiers_to_internal_ids)
-    rfids = sorted(rfid_to_internal_id)
-    pipeline = [
-        {
-            "$match": {
-                "$or": [
-                    {"cow_id": {"$in": identifiers}},
-                    {"rfid": {"$in": rfids}},
-                ]
-            }
-        },
-        {"$sort": {"date": -1, "_id": 1}},
-        {
-            "$group": {
-                "_id": {"$ifNull": ["$rfid", "$cow_id"]},
-                "record": {"$first": "$$ROOT"},
-            }
-        },
-        {"$sort": {"record.date": -1, "record._id": 1}},
-        {
-            "$project": {
-                "_id": 1,
-                "rfid": "$record.rfid",
-                "date": "$record.date",
-                "appetite_class": "$record.appetite_class",
-                "appetite": "$record.appetite",
-            }
-        },
-    ]
-    latest_by_internal_id = {}
-    async for record in cols.daily.aggregate(pipeline):
-        raw_rfid = record.get("rfid")
-        internal_id = (
-            rfid_to_internal_id.get(normalize_cow_identifier(raw_rfid))
-            if isinstance(raw_rfid, str) and raw_rfid.strip()
-            else None
-        )
-        if internal_id is None:
-            raw_identifier = record.get("_id")
-            if raw_identifier is not None:
-                internal_id = unambiguous_identifiers.get(
-                    normalize_cow_identifier(str(raw_identifier))
-                )
-        if internal_id is None or internal_id in latest_by_internal_id:
+    pipeline = _home_daily_pipeline(identifiers, require_appetite=True)
+    async for grouped in cols.daily.aggregate(pipeline):
+        internal_id = internal_by_identifier.get(grouped.get("_id"))
+        record = grouped.get("doc")
+        if (
+            internal_id is None
+            or internal_id not in appetite_by_internal_id
+            or record is None
+            or appetite_by_internal_id[internal_id]["date"] is not None
+        ):
             continue
-        latest_by_internal_id[internal_id] = record
-
-    for internal_id, record in latest_by_internal_id.items():
+        result, source, raw = _resolve_home_appetite(record)
         appetite_by_internal_id[internal_id].update(
-            appetite=_home_appetite_class(_home_appetite_raw(record)),
-            raw=_home_appetite_raw(record),
+            appetite=result,
+            source=source,
+            raw=raw,
             date=_home_appetite_date(record.get("date")),
         )
 
     return {"appetite": appetite_by_internal_id}
+
+
+@router.get("/home/appetite/debug")
+async def home_appetite_debug(request: Request, actor: dict = Depends(get_actor)):
+    cols = request.app.state.cols
+    cursor = (
+        cols.profiles.find(owner_filter(actor), {"_id": 1, "cow_id": 1})
+        .sort("_id", 1)
+        .limit(MAX_HOME_APPETITE_COWS + 1)
+    )
+    owned_profiles = [profile async for profile in cursor]
+    if len(owned_profiles) > MAX_HOME_APPETITE_COWS:
+        raise HTTPException(
+            413,
+            f"Home appetite debug is limited to {MAX_HOME_APPETITE_COWS} cows",
+        )
+    profiles = owned_profiles[:10]
+    _, internal_by_identifier = _home_profiles_index(profiles)
+    identifiers = sorted(internal_by_identifier)
+    _, all_owned_identifiers = _home_profiles_index(owned_profiles)
+    stats_identifiers = sorted(all_owned_identifiers)
+    if not identifiers or not stats_identifiers:
+        return {
+            "cows": [],
+            "total_cows": len(owned_profiles),
+            "total_daily_docs_with_appetite_class": 0,
+            "top_raw_labels": [],
+        }
+
+    newest_by_internal_id = {}
+    async for grouped in cols.daily.aggregate(
+        _home_daily_pipeline(identifiers, require_appetite=False)
+    ):
+        internal_id = internal_by_identifier.get(grouped.get("_id"))
+        record = grouped.get("doc")
+        if internal_id is not None and record is not None:
+            newest_by_internal_id.setdefault(internal_id, record)
+
+    chosen_by_internal_id = {}
+    async for grouped in cols.daily.aggregate(
+        _home_daily_pipeline(identifiers, require_appetite=True)
+    ):
+        internal_id = internal_by_identifier.get(grouped.get("_id"))
+        record = grouped.get("doc")
+        if internal_id is not None and record is not None:
+            chosen_by_internal_id.setdefault(internal_id, record)
+
+    appetite_class_match = {"appetite_class": {"$exists": True}}
+    raw_label_match = {"appetite_class": {"$type": "string", "$regex": r"\S"}}
+    stats_pipeline = [
+        {"$match": {"$expr": {"$in": [_mongo_home_cow_id(), stats_identifiers]}}},
+        {
+            "$facet": {
+                "total": [
+                    {"$match": appetite_class_match},
+                    {"$count": "count"},
+                ],
+                "labels": [
+                    {"$match": raw_label_match},
+                    {"$group": {"_id": "$appetite_class", "count": {"$sum": 1}}},
+                    {"$sort": {"count": -1, "_id": 1}},
+                    {"$limit": 10},
+                    {"$project": {"_id": 0, "raw": "$_id", "count": 1}},
+                ],
+            }
+        },
+    ]
+    stats_cursor = cols.daily.aggregate(stats_pipeline)
+    stats = {}
+    async for item in stats_cursor:
+        stats = item
+        break
+    total = stats.get("total", [])
+    cows_debug = []
+    for profile in profiles:
+        if profile.get("_id") is None:
+            continue
+        internal_id = str(profile["_id"])
+        newest = newest_by_internal_id.get(internal_id)
+        chosen = chosen_by_internal_id.get(internal_id)
+        chosen_fields = None
+        if chosen is not None:
+            result, source, raw = _resolve_home_appetite(chosen)
+            chosen_fields = {
+                **_home_daily_appetite_fields(chosen),
+                "label": result,
+                "source": source,
+                "raw": _home_json_value(raw),
+            }
+        cows_debug.append(
+            {
+                "profile": {
+                    "_id": internal_id,
+                    "cow_id": profile.get("cow_id"),
+                },
+                "newest_daily": (
+                    _home_daily_appetite_fields(newest) if newest is not None else None
+                ),
+                "chosen_doc": chosen_fields,
+            }
+        )
+
+    return {
+        "cows": cows_debug,
+        "total_cows": len(owned_profiles),
+        "total_daily_docs_with_appetite_class": (
+            total[0]["count"] if total else 0
+        ),
+        "top_raw_labels": stats.get("labels", []),
+    }
 
 
 @router.get("/latest/{cow_id}")
