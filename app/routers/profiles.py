@@ -78,7 +78,7 @@ async def create_profile(p: CowProfileCreate, request: Request, actor: dict = De
     ):
         raise HTTPException(409, f"Cow {cid} already exists")
     if p.nfc_uid is not None and await cols.profiles.find_one(
-        {"nfc_uid": p.nfc_uid}, {"_id": 1}
+        {"$or": [{"nfc_uid": p.nfc_uid}, {"_id": p.nfc_uid}]}, {"_id": 1}
     ):
         raise HTTPException(409, "NFC UID already assigned to another cow")
 
@@ -108,10 +108,12 @@ async def get_profile_by_nfc(uid: str, request: Request, actor: dict = Depends(g
         normalized = normalize_nfc_uid(uid)
     except ValueError:
         raise HTTPException(400, "Invalid NFC UID")
-    profile = await request.app.state.cols.profiles.find_one(
-        {"nfc_uid": normalized, **owner_filter(actor)}
-    )
+    tag_query = {"$or": [{"nfc_uid": normalized}, {"_id": normalized}]}
+    profiles = request.app.state.cols.profiles
+    profile = await profiles.find_one({**tag_query, **owner_filter(actor)})
     if profile is None:
+        if await profiles.find_one(tag_query, {"_id": 1}):
+            raise HTTPException(409, "Tag already registered elsewhere")
         raise HTTPException(404, "No profile for NFC UID")
     return profile_out(profile)
 
