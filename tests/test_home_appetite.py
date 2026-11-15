@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import secrets
@@ -5,6 +6,7 @@ import unittest
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+from bson import ObjectId
 
 os.environ.setdefault("JWT_SECRET", secrets.token_urlsafe(32))
 
@@ -60,22 +62,58 @@ class FakeDailyCollection:
         self.records = records
         self.pipelines = []
 
-    def aggregate(self, pipeline):
+    async def aggregate(self, pipeline):
         self.pipelines.append(pipeline)
         match = pipeline[0]["$match"]
-        identifiers = match["$expr"]["$in"][1]
+        expressions = match["$expr"].get("$or", [])
+        identifiers = expressions[0]["$in"][1] if expressions else []
+        if "$facet" in pipeline[1]:
+            matched = [
+                record
+                for record in self.records
+                if _normalized_cow_id(record.get("cow_id")) in identifiers
+                or _normalized_cow_id(record.get("rfid")) in identifiers
+            ]
+            labels = {}
+            for record in matched:
+                label = record.get("appetite_class")
+                if isinstance(label, str) and label.strip():
+                    labels[label] = labels.get(label, 0) + 1
+            stats = {
+                "total": (
+                    [{"count": sum("appetite_class" in item for item in matched)}]
+                    if any("appetite_class" in item for item in matched)
+                    else []
+                ),
+                "labels": [
+                    {"raw": label, "count": count}
+                    for label, count in sorted(
+                        labels.items(), key=lambda item: (-item[1], item[0])
+                    )[:10]
+                ],
+            }
+            return AsyncCursor([stats])
+
         require_appetite = "$or" in match
         records = [
             record
             for record in self.records
-            if _normalized_cow_id(record.get("cow_id")) in identifiers
+            if (
+                _normalized_cow_id(record.get("cow_id")) in identifiers
+                or _normalized_cow_id(record.get("rfid")) in identifiers
+            )
             and (not require_appetite or _has_appetite(record))
         ]
         records.sort(key=lambda record: record["date"], reverse=True)
 
         latest_by_cow = {}
         for record in records:
-            identifier = _normalized_cow_id(record["cow_id"])
+            cow_id = _normalized_cow_id(record.get("cow_id"))
+            identifier = (
+                cow_id
+                if cow_id in identifiers
+                else _normalized_cow_id(record.get("rfid"))
+            )
             latest_by_cow.setdefault(identifier, record)
 
         grouped = [
@@ -87,6 +125,98 @@ class FakeDailyCollection:
 
 
 class HomeAppetiteEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_admin_and_eleveur_match_profile_aliases_and_return_json_safe_data(self):
+        profile_id = ObjectId()
+        profile = {
+            "_id": profile_id,
+            "cow_id": "COW001",
+            "rfid": "RFID-01",
+            "nfc_uid": "NFC-0001",
+        }
+        profile_with_object_id_raw = {
+            "_id": ObjectId(),
+            "cow_id": "COW002",
+            "rfid": "RFID-02",
+            "nfc_uid": "NFC-0002",
+        }
+        newest_without_appetite = {
+            "_id": ObjectId(),
+            "cow_id": "COW-001",
+            "date": datetime(2026, 11, 16, tzinfo=timezone.utc),
+        }
+        older_with_appetite = {
+            "_id": ObjectId(),
+            "cow_id": "RFID-01",
+            "rfid": "RFID01",
+            "date": datetime(2026, 11, 15, tzinfo=timezone.utc),
+            "appetite_class": "low",
+            "appetite_pct": {"low": float("nan")},
+            "appetite_computed_at": datetime(2026, 11, 15, tzinfo=timezone.utc),
+            "appetite": {"category": "low", "source_id": ObjectId()},
+        }
+        percentage_with_object_id = {
+            "_id": ObjectId(),
+            "cow_id": "COW002",
+            "rfid": "RFID-02",
+            "date": datetime(2026, 11, 17, tzinfo=timezone.utc),
+            "appetite_pct": {"high": 70, "metadata": ObjectId()},
+        }
+        percentage_metadata_id = percentage_with_object_id["appetite_pct"]["metadata"]
+
+        for role in ("admin", "eleveur"):
+            with self.subTest(role=role):
+                daily = FakeDailyCollection(
+                    [
+                        newest_without_appetite,
+                        older_with_appetite,
+                        percentage_with_object_id,
+                    ]
+                )
+                cols = SimpleNamespace(
+                    profiles=SimpleNamespace(
+                        find=lambda *_args: AsyncCursor(
+                            [profile, profile_with_object_id_raw]
+                        )
+                    ),
+                    daily=daily,
+                )
+                request = SimpleNamespace(
+                    app=SimpleNamespace(state=SimpleNamespace(cols=cols))
+                )
+                actor = {"role": role, "admin_id": ObjectId()}
+
+                response = await home_appetite(request, actor)
+                self.assertEqual(
+                    response["appetite"][str(profile_id)],
+                    {
+                        "cow_id": "COW001",
+                        "appetite": "decreasing",
+                        "source": "appetite_class",
+                        "raw": "low",
+                        "date": "2026-11-15",
+                    },
+                )
+                self.assertEqual(
+                    response["appetite"][str(profile_with_object_id_raw["_id"])][
+                        "raw"
+                    ],
+                    {
+                        "high": 70,
+                        "metadata": str(percentage_metadata_id),
+                    },
+                )
+                json.dumps(response, allow_nan=False)
+                debug = await home_appetite_debug(request, actor)
+                self.assertEqual(debug["cows"][0]["profile"]["cow_id"], "COW001")
+                self.assertEqual(
+                    debug["cows"][0]["chosen_doc"]["date"], "2026-11-15"
+                )
+                serialized = json.dumps(debug, allow_nan=False)
+                self.assertIn(
+                    str(older_with_appetite["appetite"]["source_id"]), serialized
+                )
+                self.assertIn('"low": null', serialized)
+
     async def test_latest_record_with_appetite_and_all_supported_sources(self):
         profiles = [
             {"_id": "RFID-01", "cow_id": "COW001"},
@@ -277,8 +407,12 @@ class HomeAppetiteEndpointTests(unittest.IsolatedAsyncioTestCase):
                     ]
                 ),
             ],
-            aggregate=lambda _pipeline: daily.responses.pop(0),
         )
+
+        async def aggregate(_pipeline):
+            return daily.responses.pop(0)
+
+        daily.aggregate = aggregate
         cols = SimpleNamespace(
             profiles=SimpleNamespace(find=lambda *_args: profile_cursor),
             daily=daily,
@@ -298,3 +432,30 @@ class HomeAppetiteEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cow["chosen_doc"]["source"], "appetite_class")
         self.assertEqual(cow["chosen_doc"]["raw"], "Low")
         self.assertNotIn("admin_id", repr(response))
+
+    async def test_debug_endpoint_returns_temporary_traceback_details(self):
+        async def fail_aggregate(_pipeline):
+            raise RuntimeError("fake aggregation failure")
+
+        request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    cols=SimpleNamespace(
+                        profiles=SimpleNamespace(
+                            find=lambda *_args: AsyncCursor(
+                                [{"_id": "RFID-01", "cow_id": "COW001"}]
+                            )
+                        ),
+                        daily=SimpleNamespace(aggregate=fail_aggregate),
+                    )
+                )
+            )
+        )
+
+        response = await home_appetite_debug(
+            request, {"role": "admin", "admin_id": "admin-1"}
+        )
+
+        self.assertEqual(response["error"], "RuntimeError")
+        self.assertEqual(response["message"], "fake aggregation failure")
+        self.assertLessEqual(len(response["traceback"]), 10)

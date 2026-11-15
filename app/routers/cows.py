@@ -1,10 +1,13 @@
 """Cows: what the Flutter CowService calls (all scoped to the caller)."""
 import logging
 import math
+import os
 import re
+import traceback
 from datetime import date as Date, datetime, timezone
 from typing import Optional
 
+from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.config import settings
@@ -55,13 +58,13 @@ def _home_cow_id(value: object) -> str:
     return re.sub(r"[\s_-]+", "", str(value)).casefold()
 
 
-def _mongo_home_cow_id():
+def _mongo_home_cow_id(field: str = "$cow_id"):
     return {
         "$toLower": {
             "$regexReplace": {
                 "input": {
                     "$convert": {
-                        "input": "$cow_id",
+                        "input": field,
                         "to": "string",
                         "onError": "",
                         "onNull": "",
@@ -70,6 +73,17 @@ def _mongo_home_cow_id():
                 "regex": r"[\s_-]+",
                 "replacement": "",
             }
+        }
+    }
+
+
+def _mongo_home_profile_match(identifiers: list[str]) -> dict:
+    return {
+        "$expr": {
+            "$or": [
+                {"$in": [_mongo_home_cow_id("$cow_id"), identifiers]},
+                {"$in": [_mongo_home_cow_id("$rfid"), identifiers]},
+            ]
         }
     }
 
@@ -85,16 +99,23 @@ def _home_appetite_match_conditions():
 
 
 def _home_daily_pipeline(identifiers: list[str], require_appetite: bool) -> list[dict]:
-    match = {"$expr": {"$in": [_mongo_home_cow_id(), identifiers]}}
+    match = _mongo_home_profile_match(identifiers)
     if require_appetite:
         match["$or"] = _home_appetite_match_conditions()
-    normalized_cow_id = _mongo_home_cow_id()
+    normalized_cow_id = _mongo_home_cow_id("$cow_id")
+    normalized_rfid = _mongo_home_cow_id("$rfid")
     return [
         {"$match": match},
         {"$sort": {"date": -1}},
         {
             "$group": {
-                "_id": normalized_cow_id,
+                "_id": {
+                    "$cond": [
+                        {"$in": [normalized_cow_id, identifiers]},
+                        normalized_cow_id,
+                        normalized_rfid,
+                    ]
+                },
                 "doc": {"$first": "$$ROOT"},
             }
         },
@@ -122,7 +143,12 @@ def _home_profiles_index(profiles: list[dict]) -> tuple[dict, dict]:
             "raw": None,
             "date": None,
         }
-        for value in (profile["_id"], raw_cow_id):
+        for value in (
+            profile["_id"],
+            raw_cow_id,
+            profile.get("rfid"),
+            profile.get("nfc_uid"),
+        ):
             identifier = _home_cow_id(value)
             if identifier:
                 owners_by_identifier.setdefault(identifier, set()).add(internal_id)
@@ -177,9 +203,13 @@ def _home_json_value(value: object):
         return value.isoformat()
     if isinstance(value, Date):
         return value.isoformat()
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     if isinstance(value, dict):
         return {str(key): _home_json_value(item) for key, item in value.items()}
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [_home_json_value(item) for item in value]
     return value
 
@@ -211,7 +241,11 @@ def _home_appetite_date(value: object) -> Optional[str]:
 
 @router.get("/health")
 async def health():
-    return {"status": "ok", "pi_ai_configured": bool(settings.pi_ai_url)}
+    return {
+        "status": "ok",
+        "pi_ai_configured": bool(settings.pi_ai_url),
+        "build": os.getenv("RENDER_GIT_COMMIT", "unknown"),
+    }
 
 
 @router.get("/cows")
@@ -233,7 +267,7 @@ async def home_appetite(request: Request, actor: dict = Depends(get_actor)):
     profiles_cursor = (
         cols.profiles.find(
             owner_filter(actor),
-            {"_id": 1, "cow_id": 1},
+            {"_id": 1, "cow_id": 1, "rfid": 1, "nfc_uid": 1},
         )
         .sort("_id", 1)
         .limit(MAX_HOME_APPETITE_COWS + 1)
@@ -248,10 +282,11 @@ async def home_appetite(request: Request, actor: dict = Depends(get_actor)):
     appetite_by_internal_id, internal_by_identifier = _home_profiles_index(profiles)
     identifiers = sorted(internal_by_identifier)
     if not identifiers:
-        return {"appetite": appetite_by_internal_id}
+        return _home_json_value({"appetite": appetite_by_internal_id})
 
     pipeline = _home_daily_pipeline(identifiers, require_appetite=True)
-    async for grouped in cols.daily.aggregate(pipeline):
+    cursor = await cols.daily.aggregate(pipeline)
+    async for grouped in cursor:
         internal_id = internal_by_identifier.get(grouped.get("_id"))
         record = grouped.get("doc")
         if (
@@ -265,18 +300,21 @@ async def home_appetite(request: Request, actor: dict = Depends(get_actor)):
         appetite_by_internal_id[internal_id].update(
             appetite=result,
             source=source,
-            raw=raw,
+            raw=_home_json_value(raw),
             date=_home_appetite_date(record.get("date")),
         )
 
-    return {"appetite": appetite_by_internal_id}
+    return _home_json_value({"appetite": appetite_by_internal_id})
 
 
 @router.get("/home/appetite/debug")
-async def home_appetite_debug(request: Request, actor: dict = Depends(get_actor)):
+async def _home_appetite_debug_response(request: Request, actor: dict) -> dict:
     cols = request.app.state.cols
     cursor = (
-        cols.profiles.find(owner_filter(actor), {"_id": 1, "cow_id": 1})
+        cols.profiles.find(
+            owner_filter(actor),
+            {"_id": 1, "cow_id": 1, "rfid": 1, "nfc_uid": 1},
+        )
         .sort("_id", 1)
         .limit(MAX_HOME_APPETITE_COWS + 1)
     )
@@ -293,25 +331,38 @@ async def home_appetite_debug(request: Request, actor: dict = Depends(get_actor)
     stats_identifiers = sorted(all_owned_identifiers)
     if not identifiers or not stats_identifiers:
         return {
-            "cows": [],
+            "cows": [
+                {
+                    "profile": {
+                        "_id": str(profile["_id"]),
+                        "cow_id": profile.get("cow_id"),
+                    },
+                    "newest_daily": None,
+                    "chosen_doc": None,
+                }
+                for profile in profiles
+                if profile.get("_id") is not None
+            ],
             "total_cows": len(owned_profiles),
             "total_daily_docs_with_appetite_class": 0,
             "top_raw_labels": [],
         }
 
     newest_by_internal_id = {}
-    async for grouped in cols.daily.aggregate(
+    newest_cursor = await cols.daily.aggregate(
         _home_daily_pipeline(identifiers, require_appetite=False)
-    ):
+    )
+    async for grouped in newest_cursor:
         internal_id = internal_by_identifier.get(grouped.get("_id"))
         record = grouped.get("doc")
         if internal_id is not None and record is not None:
             newest_by_internal_id.setdefault(internal_id, record)
 
     chosen_by_internal_id = {}
-    async for grouped in cols.daily.aggregate(
+    chosen_cursor = await cols.daily.aggregate(
         _home_daily_pipeline(identifiers, require_appetite=True)
-    ):
+    )
+    async for grouped in chosen_cursor:
         internal_id = internal_by_identifier.get(grouped.get("_id"))
         record = grouped.get("doc")
         if internal_id is not None and record is not None:
@@ -320,7 +371,7 @@ async def home_appetite_debug(request: Request, actor: dict = Depends(get_actor)
     appetite_class_match = {"appetite_class": {"$exists": True}}
     raw_label_match = {"appetite_class": {"$type": "string", "$regex": r"\S"}}
     stats_pipeline = [
-        {"$match": {"$expr": {"$in": [_mongo_home_cow_id(), stats_identifiers]}}},
+        {"$match": _mongo_home_profile_match(stats_identifiers)},
         {
             "$facet": {
                 "total": [
@@ -337,7 +388,7 @@ async def home_appetite_debug(request: Request, actor: dict = Depends(get_actor)
             }
         },
     ]
-    stats_cursor = cols.daily.aggregate(stats_pipeline)
+    stats_cursor = await cols.daily.aggregate(stats_pipeline)
     stats = {}
     async for item in stats_cursor:
         stats = item
@@ -380,6 +431,21 @@ async def home_appetite_debug(request: Request, actor: dict = Depends(get_actor)
         ),
         "top_raw_labels": stats.get("labels", []),
     }
+
+
+@router.get("/home/appetite/debug")
+async def home_appetite_debug(request: Request, actor: dict = Depends(get_actor)):
+    try:
+        return _home_json_value(await _home_appetite_debug_response(request, actor))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.exception("Home appetite debug endpoint failed")
+        return {
+            "error": type(exc).__name__,
+            "message": str(exc)[:300],
+            "traceback": traceback.format_exc().splitlines()[-10:],
+        }
 
 
 @router.get("/latest/{cow_id}")
