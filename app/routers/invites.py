@@ -19,12 +19,12 @@ class InviteCheckIn(BaseModel):
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_invite(request: Request, admin: dict = Depends(admin_only)):
     now = datetime.now(timezone.utc)
-    code = secrets.token_urlsafe(24)
+    code = secrets.token_urlsafe(32)
     document = {
         "code_hash": hashlib.sha256(code.encode("utf-8")).hexdigest(),
         "admin_id": admin["id"],
         "created_at": now,
-        "expires_at": now + timedelta(hours=settings.invite_ttl_hours),
+        "expires_at": now + timedelta(minutes=3),
         "used_at": None,
         "used_by": None,
     }

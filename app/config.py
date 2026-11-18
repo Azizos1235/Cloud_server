@@ -11,7 +11,6 @@ class Settings(BaseSettings):
     mongo_uri: str
     mongo_db: str = "farm"
     jwt_secret: str                                        # same secret as the auth backend
-    invite_ttl_hours: int = 24
     jwt_expire_hours: int = 168
     eleveur_jwt_expire_hours: int = 8760
     superuser_email: str = ""

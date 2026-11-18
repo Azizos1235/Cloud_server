@@ -13,6 +13,8 @@ class Cols:
         self.eleveurs = db["eleveurs"]
         self.superusers = db["superusers"]
         self.invites = db["invites"]
+        self.qr_tokens = db["qr_tokens"]
+        self.tasks = db["tasks"]
         self.subscription_requests = db["subscription_requests"]
         self.profiles = db[settings.mongo_profiles_collection]
         self.realtime = db[settings.mongo_realtime_collection]
@@ -60,6 +62,22 @@ async def ensure_index(cols: Cols):
         (cols.superusers, [("email", 1)], {"unique": True}),
         (cols.invites, [("code_hash", 1)], {"unique": True}),
         (cols.invites, [("admin_id", 1)], {}),
+        (cols.qr_tokens, [("token_hash", 1)], {"unique": True}),
+        (
+            cols.qr_tokens,
+            [("eleveur_id", 1)],
+            {
+                "unique": True,
+                "partialFilterExpression": {"used": False},
+            },
+        ),
+        (
+            cols.qr_tokens,
+            [("expires_at", 1)],
+            {"expireAfterSeconds": 3600},
+        ),
+        (cols.tasks, [("eleveur_id", 1), ("status", 1), ("due_at", 1)], {}),
+        (cols.tasks, [("admin_id", 1), ("created_at", -1)], {}),
         (cols.subscription_requests, [("status", 1), ("created_at", -1)], {}),
         (cols.daily,    [("cow_id", 1), ("date", -1)], {}),
         (cols.daily,    [("rfid", 1), ("date", -1)],

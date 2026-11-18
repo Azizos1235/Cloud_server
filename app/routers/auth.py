@@ -1,10 +1,12 @@
 import hashlib
 import logging
+import unicodedata
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from jwt import InvalidTokenError
+from pymongo import ReturnDocument
 
 from app.deps import _bearer_token, get_actor_allow_expired, get_superuser, rate_limit
 from app.security import create_access_token, decode_access_token, hash_password, verify_password
@@ -34,6 +36,43 @@ class EleveurRegisterIn(BaseModel):
         return value
 
 
+class EleveurQrLoginIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str
+    name: str
+
+    @field_validator("token")
+    @classmethod
+    def validate_token(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("token is required")
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def trim_and_validate_name(cls, value: str) -> str:
+        value = value.strip()
+        if not 2 <= len(value) <= 60:
+            raise ValueError("name must be between 2 and 60 characters")
+        return value
+
+
+class EleveurNameCheckIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def trim_and_validate_name(cls, value: str) -> str:
+        value = value.strip()
+        if not 2 <= len(value) <= 60:
+            raise ValueError("name must be between 2 and 60 characters")
+        return value
+
+
 class ChangePasswordIn(BaseModel):
     current_password: str
     new_password: str = Field(min_length=8)
@@ -41,6 +80,43 @@ class ChangePasswordIn(BaseModel):
 
 def _email(value: str) -> str:
     return value.strip().lower()
+
+
+def _normalized_name(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value.strip().casefold())
+    return "".join(character for character in decomposed if not unicodedata.combining(character))
+
+
+def _qr_error(document: dict | None, now: datetime) -> HTTPException:
+    if document is None:
+        return HTTPException(404, "QR code not found")
+    expires_at = document.get("expires_at")
+    if not isinstance(expires_at, datetime):
+        return HTTPException(404, "QR code not found")
+    if expires_at <= now:
+        return HTTPException(410, "QR code expired, ask your admin for a new one")
+    if document.get("used", False):
+        return HTTPException(409, "QR code already used")
+    if document.get("revoked", False):
+        return HTTPException(429, "Too many attempts")
+    return HTTPException(404, "QR code not found")
+
+
+async def _find_qr_or_raise(qr_tokens, token_hash: str, now: datetime) -> dict:
+    document = await qr_tokens.find_one({"token_hash": token_hash})
+    if document is None or document.get("expires_at") is None:
+        raise _qr_error(document, now)
+    if (
+        document["expires_at"] <= now
+        or document.get("used", False)
+        or document.get("revoked", False)
+    ):
+        raise _qr_error(document, now)
+    return document
+
+
+def _eleveur_name_matches(eleveur: dict, name: str) -> bool:
+    return _normalized_name(eleveur.get("name", "")) == _normalized_name(name)
 
 
 def _public_user(document: dict, role: str) -> dict:
@@ -118,6 +194,7 @@ async def eleveur_register(
     except Exception:
         try:
             if inserted_id is not None:
+                await cols.tasks.delete_many({"eleveur_id": inserted_id})
                 await cols.eleveurs.delete_one({"_id": inserted_id})
             await cols.invites.update_one(
                 {"_id": invite["_id"], "used_at": now},
@@ -126,6 +203,96 @@ async def eleveur_register(
         except Exception:
             log.exception("Failed to roll back éleveur invite registration")
         raise
+
+
+@router.post("/eleveur/qr-login", dependencies=[Depends(rate_limit)])
+async def eleveur_qr_login(body: EleveurQrLoginIn, request: Request):
+    cols = request.app.state.cols
+    token_hash = hashlib.sha256(body.token.encode("utf-8")).hexdigest()
+    now = datetime.now(timezone.utc)
+    qr = await _find_qr_or_raise(cols.qr_tokens, token_hash, now)
+    eleveur = await cols.eleveurs.find_one({"_id": qr["eleveur_id"]})
+    if eleveur is None or eleveur.get("admin_id") != qr["admin_id"]:
+        raise HTTPException(404, "QR code not found")
+    if not _eleveur_name_matches(eleveur, body.name):
+        attempt_now = datetime.now(timezone.utc)
+        updated = await cols.qr_tokens.find_one_and_update(
+            {
+                "token_hash": token_hash,
+                "used": False,
+                "revoked": False,
+                "expires_at": {"$gt": attempt_now},
+            },
+            [
+                {
+                    "$set": {
+                        "failed_attempts": {
+                            "$add": [{"$ifNull": ["$failed_attempts", 0]}, 1]
+                        },
+                        "revoked": {
+                            "$gte": [
+                                {"$add": [{"$ifNull": ["$failed_attempts", 0]}, 1]},
+                                5,
+                            ]
+                        },
+                    }
+                }
+            ],
+            return_document=ReturnDocument.AFTER,
+        )
+        if updated is None:
+            raise _qr_error(
+                await cols.qr_tokens.find_one({"token_hash": token_hash}),
+                datetime.now(timezone.utc),
+            )
+        if updated.get("revoked", False):
+            raise HTTPException(429, "Too many attempts")
+        raise HTTPException(401, "Name does not match")
+
+    claim_now = datetime.now(timezone.utc)
+    consumed = await cols.qr_tokens.find_one_and_update(
+        {
+            "token_hash": token_hash,
+            "eleveur_id": qr["eleveur_id"],
+            "used": False,
+            "revoked": False,
+            "expires_at": {"$gt": claim_now},
+        },
+        {
+            "$set": {
+                "used": True,
+                "used_at": claim_now,
+                "used_by": qr["eleveur_id"],
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if consumed is None:
+        raise _qr_error(
+            await cols.qr_tokens.find_one({"token_hash": token_hash}),
+            datetime.now(timezone.utc),
+        )
+
+    return {
+        "token": create_access_token(str(eleveur["_id"]), "eleveur"),
+        "user": _public_user(eleveur, "eleveur"),
+    }
+
+
+@router.post("/eleveur/verify-name", dependencies=[Depends(rate_limit)])
+async def verify_eleveur_name(
+    body: EleveurNameCheckIn,
+    request: Request,
+    actor: dict = Depends(get_actor_allow_expired),
+):
+    if actor["role"] != "eleveur":
+        raise HTTPException(403, "Éleveur access required")
+    eleveur = await request.app.state.cols.eleveurs.find_one({"_id": actor["id"]})
+    if eleveur is None:
+        raise HTTPException(401, "Invalid token")
+    if not _eleveur_name_matches(eleveur, body.name):
+        raise HTTPException(401, "Name does not match")
+    return _public_user(eleveur, "eleveur")
 
 
 @router.get("/me")

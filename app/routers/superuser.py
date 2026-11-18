@@ -247,6 +247,7 @@ async def delete_admin(
     if cow_ids:
         alert_filters.append({"cow_id": {"$in": cow_ids}})
 
+    await cols.tasks.delete_many({"admin_id": oid})
     await cols.eleveurs.delete_many({"admin_id": oid})
     await cols.invites.delete_many({"admin_id": oid})
     await cols.profiles.delete_many({"admin_id": oid})

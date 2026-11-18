@@ -12,13 +12,24 @@ from app.db import Cols, adopt_orphans, ensure_index
 from app.ingest.consumer import run_queue
 from app.ingest.handlers import handle_daily, handle_dispatch, handle_realtime
 from app.jobs.appetite import appetite_scheduler
-from app.routers import alerts, auth, cows, eleveurs, invites, profiles, subscription, superuser, ws
+from app.routers import (
+    alerts,
+    auth,
+    cows,
+    eleveurs,
+    invites,
+    profiles,
+    subscription,
+    superuser,
+    tasks,
+    ws,
+)
 from app.security import ensure_bootstrap_superuser, ensure_default_admin
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    client = AsyncMongoClient(settings.mongo_uri)
+    client = AsyncMongoClient(settings.mongo_uri, tz_aware=True)
     cols = Cols(client[settings.mongo_db])
     app.state.cols = cols
     await ensure_index(cols)
@@ -54,6 +65,7 @@ app.include_router(cows.router)
 app.include_router(auth.router)
 app.include_router(invites.router)
 app.include_router(eleveurs.router)
+app.include_router(tasks.router)
 app.include_router(profiles.router)
 app.include_router(alerts.router)
 app.include_router(subscription.router)
