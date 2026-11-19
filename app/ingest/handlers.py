@@ -105,7 +105,7 @@ async def handle_daily(message: aio_pika.abc.AbstractIncomingMessage, cols: Cols
                 item["_id"],
             )
         for d in items:
-            if d["cow_id"] and d.get("appetite_class") and d.get("appetite_pct"):
+            if d["cow_id"] and d.get("appetite_class"):
                 await appetite_alert(
                     cols, d["cow_id"], d["date"], d["appetite_class"], d["appetite_pct"]
                 )

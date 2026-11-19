@@ -16,7 +16,6 @@ class Settings(BaseSettings):
     superuser_email: str = ""
     superuser_password: str = ""
     subscription_days_per_month: int = 30
-    appetite_alert_threshold: float = 65
     default_admin_email: str = ""
     default_admin_password: str = ""
     default_admin_name: str = "Default Admin"
@@ -34,7 +33,7 @@ class Settings(BaseSettings):
 
     pi_ai_url: str = "http://127.0.0.1:8001"
     pi_proxy: str = ""
-    pi_ai_timeout: float = 30.0
+    pi_ai_timeout: float = 5.0
     realtime_ttl_days: int = 90                            # 0 = keep forever
 
     # --- end-of-day appetite job ---

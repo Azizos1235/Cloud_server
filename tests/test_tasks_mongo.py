@@ -188,7 +188,7 @@ class RealMongoTaskTests(unittest.IsolatedAsyncioTestCase):
             "GET",
             "/tasks/mine",
         )
-        self.assertEqual([item["title"] for item in mine.json()], ["First", "Second"])
+        self.assertEqual([item["title"] for item in mine.json()], ["Second", "First"])
         self.assertNotIn(str(self.other_eleveur_id), str(mine.json()))
 
     async def test_done_is_idempotent_hides_from_farmer_and_keeps_admin_record(self):
@@ -200,7 +200,10 @@ class RealMongoTaskTests(unittest.IsolatedAsyncioTestCase):
             farmer_app,
             "POST",
             f"/tasks/{task_id}/done",
-            {"completed_by": str(self.other_eleveur_id)},
+            {
+                "completed_weight_kg": 412.5,
+                "completion_note": "État corporel correct",
+            },
         )
         second = await self._request(
             farmer_app,
@@ -212,9 +215,17 @@ class RealMongoTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.status_code, 200)
         self.assertEqual(first.json()["completed_by"], str(self.eleveur_id))
         self.assertEqual(first.json()["completed_at"], second.json()["completed_at"])
+        self.assertEqual(first.json()["completed_weight_kg"], 412.5)
+        self.assertEqual(first.json()["completion_note"], "État corporel correct")
         self.assertEqual((await self._request(
             farmer_app, "GET", "/tasks/mine"
         )).json(), [])
+        completion_alerts = await self.cols.alerts.find(
+            {"type": "task_completed"}
+        ).to_list()
+        self.assertEqual(len(completion_alerts), 1)
+        self.assertIn("Farmer One", completion_alerts[0]["message"])
+        self.assertIn("412.5 kg", completion_alerts[0]["message"])
 
         admin_list = await self._request(
             self._app("admin", self.admin_id),
@@ -224,6 +235,40 @@ class RealMongoTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(admin_list.json()), 1)
         self.assertEqual(admin_list.json()[0]["status"], "done")
         self.assertEqual(admin_list.json()[0]["completed_by_name"], "Farmer One")
+
+    async def test_create_task_links_and_handles_appetite_alert(self):
+        alert_id = ObjectId()
+        await self.cols.alerts.insert_one(
+            {
+                "_id": alert_id,
+                "source": "system",
+                "type": "appetite_high",
+                "admin_id": self.admin_id,
+                "cow_id": "COW001",
+                "handled": False,
+                "task_id": None,
+            }
+        )
+
+        response = await self._request(
+            self._app("admin", self.admin_id),
+            "POST",
+            "/tasks",
+            {
+                "eleveur_id": str(self.eleveur_id),
+                "title": "Vérifier le poids",
+                "task_type": "check_weight",
+                "alert_id": str(alert_id),
+            },
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["task_type"], "check_weight")
+        self.assertIn("Peser la vache", response.json()["plan"])
+        self.assertEqual(response.json()["alert_id"], str(alert_id))
+        alert = await self.cols.alerts.find_one({"_id": alert_id})
+        self.assertTrue(alert["handled"])
+        self.assertEqual(alert["task_id"], ObjectId(response.json()["id"]))
 
     async def test_farmer_cannot_see_or_complete_another_farmers_task(self):
         created = await self._create_task(

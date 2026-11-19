@@ -3,46 +3,22 @@ from datetime import datetime, timezone
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel
 
 from app.cow_ids import normalize_cow_identifier
-from app.deps import admin_only, get_actor, owned_cow, owner_filter
+from app.deps import admin_only, owner_filter
 from app.utils import alert_out, to_oid
 
 router = APIRouter(prefix="/alerts")
 
 
-class AdminAlertIn(BaseModel):
-    message: str
-    severity: Literal["info", "warning", "critical"] = "info"
-    cow_id: Optional[str] = None
-    action: Optional[Literal["sell", "vet", "butcher"]] = None
-
-
-@router.post("")
-async def create_admin_alert(body: AdminAlertIn, request: Request, admin: dict = Depends(admin_only)):
-    cols = request.app.state.cols
-    cow_id = await owned_cow(request, admin, body.cow_id) if body.cow_id is not None else None
-    now = datetime.now(timezone.utc)
-    await cols.alerts.insert_one({
-        "source": "admin",
-        "type": "custom_message",
-        "severity": body.severity,
-        "message": body.message,
-        "cow_id": cow_id,
-        "admin_id": admin["admin_id"],
-        "action": body.action,
-        "status": "unread",
-        "created_at": now,
-        "read_at": None,
-    })
-    return {"created": 1}
-
-
 @router.get("")
 async def list_alerts(request: Request, status: Optional[Literal["unread", "read"]] = None,
-                      limit: int = Query(50, ge=1, le=200), actor: dict = Depends(get_actor)):
-    flt = {"admin_id": actor["admin_id"]}
+                      limit: int = Query(50, ge=1, le=200), admin: dict = Depends(admin_only)):
+    flt = {
+        "admin_id": admin["id"],
+        "source": "system",
+        "type": {"$in": ["appetite_high", "appetite_low", "task_completed"]},
+    }
     if status:
         flt["status"] = status
     cur = request.app.state.cols.alerts.find(flt).sort("created_at", -1).limit(limit)
@@ -61,7 +37,7 @@ async def list_alerts(request: Request, status: Optional[Literal["unread", "read
                     {"_id": {"$in": list(identifiers)}},
                     {"cow_id": {"$in": list(identifiers)}},
                 ],
-                **owner_filter(actor),
+                **owner_filter(admin),
             },
             {"_id": 1, "cow_id": 1},
         )
@@ -86,11 +62,9 @@ async def list_alerts(request: Request, status: Optional[Literal["unread", "read
 
 
 @router.patch("/{alert_id}/read")
-async def mark_read(alert_id: str, request: Request, actor: dict = Depends(get_actor)):
-    if actor["role"] != "eleveur":
-        raise HTTPException(403, "Only the éleveur marks his alerts as read")
+async def mark_read(alert_id: str, request: Request, admin: dict = Depends(admin_only)):
     res = await request.app.state.cols.alerts.update_one(
-        {"_id": to_oid(alert_id), "admin_id": actor["admin_id"]},
+        {"_id": to_oid(alert_id), "admin_id": admin["id"], "source": "system"},
         {"$set": {"status": "read", "read_at": datetime.now(timezone.utc)}})
     if res.matched_count == 0:
         raise HTTPException(404, "Alert not found")

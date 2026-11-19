@@ -1,8 +1,11 @@
 import json
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
 
 from app.ingest.parsing import daily_update, parse_items
+from app.jobs.appetite import run_for_day
 
 
 class DailyAppetiteIngestionTests(unittest.TestCase):
@@ -110,6 +113,46 @@ class DailyAppetiteIngestionTests(unittest.TestCase):
             resent._doc[0]["$set"]["appetite"],
             {"$literal": resent_appetite},
         )
+
+
+class ExistingAppetiteAlertTriggerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_run_checks_streaks_when_daily_record_needs_no_update(self):
+        day = datetime(2026, 11, 14, tzinfo=timezone.utc).date()
+        document = {
+            "_id": "COW123-2026-11-14",
+            "cow_id": "COW123",
+            "date": datetime(2026, 11, 14, tzinfo=timezone.utc),
+            "appetite_class": "high",
+            "appetite_pct": {"high": 80.0},
+        }
+
+        class Cursor:
+            def __aiter__(self):
+                async def records():
+                    yield document
+
+                return records()
+
+        daily = SimpleNamespace(
+            find=lambda _query: Cursor(),
+            update_one=AsyncMock(),
+        )
+        cols = SimpleNamespace(daily=daily)
+        with (
+            patch("app.jobs.appetite.classify", new=AsyncMock(return_value=("high", "rule", None))),
+            patch("app.jobs.appetite.appetite_alert", new=AsyncMock()) as create_alert,
+        ):
+            updated = await run_for_day(cols, day)
+
+        self.assertEqual(updated, 0)
+        create_alert.assert_awaited_once_with(
+            cols,
+            "COW123",
+            "2026-11-14",
+            "high",
+            {"high": 80.0},
+        )
+        daily.update_one.assert_not_awaited()
 
 
 if __name__ == "__main__":

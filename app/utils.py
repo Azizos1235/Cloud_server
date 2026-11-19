@@ -80,8 +80,13 @@ def extended_subscription(expires_at: Optional[datetime], months: int, days_per_
 def alert_out(a: dict) -> dict:
     out = {k: v for k, v in a.items() if k not in ("_id", "dedupe_key", "eleveur_id")}
     for field in ("message", "severity", "cow_id", "action", "type",
-                  "appetite_class", "appetite_pct", "status", "created_at"):
+                  "appetite_class", "appetite_pct", "status", "created_at",
+                  "task_id", "handled"):
         out.setdefault(field, None)
+    if a.get("handled") is None:
+        out["handled"] = False
+    if a.get("task_id") is not None:
+        out["task_id"] = sid(a["task_id"])
     out.update(id=str(a["_id"]), admin_id=sid(a.get("admin_id")))
     return out
 

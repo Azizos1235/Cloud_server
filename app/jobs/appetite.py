@@ -119,7 +119,7 @@ async def run_for_day(cols: Cols, day: Date, cow_ids: Optional[list[str]] = None
     """Fill the missing appetite_class / appetite_pct of every summary of `day`. Returns how many were written."""
     day_dt = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
     missing_any = _missing("appetite_class") + _missing("appetite_pct")
-    flt: dict = {"date": day_dt, "$or": missing_any}
+    flt: dict = {"date": day_dt}
     if cow_ids is not None:
         flt["$and"] = [
             {"$or": [
@@ -134,11 +134,16 @@ async def run_for_day(cols: Cols, day: Date, cow_ids: Optional[list[str]] = None
             has_class = bool(str(doc.get("appetite_class") or "").strip())
             has_pct = bool(doc.get("appetite_pct"))
 
-            label, source, pct = await classify(
-                doc,
-                known_label=doc["appetite_class"].strip() if has_class else None,
-                cols=cols,
-            )
+            if has_class and has_pct:
+                label = doc["appetite_class"].strip()
+                source = doc.get("appetite_source", "rule")
+                pct = doc["appetite_pct"]
+            else:
+                label, source, pct = await classify(
+                    doc,
+                    known_label=doc["appetite_class"].strip() if has_class else None,
+                    cols=cols,
+                )
 
             update: dict = {}
             if not has_class:
@@ -146,22 +151,22 @@ async def run_for_day(cols: Cols, day: Date, cow_ids: Optional[list[str]] = None
                                "appetite_computed_at": datetime.now(timezone.utc)})
             if not has_pct and pct:
                 update["appetite_pct"] = pct
-            if not update:
-                continue
-
-            res = await cols.daily.update_one(
-                {"_id": doc["_id"], "$or": missing_any},   # never overwrite a value that just arrived
-                {"$set": update})
-            if res.modified_count:
-                written += 1
-                effective_label = doc.get("appetite_class") if has_class else label
-                effective_pct = doc.get("appetite_pct") if has_pct else pct
-                cow_id = doc["cow_id"]
-                if doc.get("rfid"):
-                    cow_id = await resolve_cow_id(cols, doc["rfid"]) or cow_id
-                await appetite_alert(
-                    cols, cow_id, day.isoformat(), effective_label, effective_pct
+            if update:
+                res = await cols.daily.update_one(
+                    {"_id": doc["_id"], "$or": missing_any},
+                    {"$set": update},
                 )
+                if res.modified_count:
+                    written += 1
+
+            effective_label = doc.get("appetite_class") if has_class else label
+            effective_pct = doc.get("appetite_pct") if has_pct else pct
+            cow_id = doc["cow_id"]
+            if doc.get("rfid"):
+                cow_id = await resolve_cow_id(cols, doc["rfid"]) or cow_id
+            await appetite_alert(
+                cols, cow_id, day.isoformat(), effective_label, effective_pct
+            )
         except Exception:
             log.exception("Appetite job failed for %s", doc.get("_id"))
     log.info("Appetite job %s: %d summary(ies) updated", day, written)
