@@ -47,11 +47,18 @@ _DEFAULTS = {
 class _MemoryCollection:
     def __init__(self, documents=None):
         self.documents = documents or {}
+        self.fail_next_insert = False
 
     async def find_one(self, query, projection=None):
-        return deepcopy(self.documents.get(query.get("_id")))
+        for document in self.documents.values():
+            if all(document.get(key) == value for key, value in query.items()):
+                return deepcopy(document)
+        return None
 
     async def insert_one(self, document):
+        if self.fail_next_insert:
+            self.fail_next_insert = False
+            raise RuntimeError("Simulated alert insert failure")
         stored = deepcopy(document)
         stored.setdefault("_id", ObjectId())
         self.documents[stored["_id"]] = stored
@@ -94,7 +101,7 @@ class TaskTypesApiTests(unittest.IsolatedAsyncioTestCase):
         self.app.dependency_overrides[get_actor] = lambda: self.actor
         self.app.include_router(tasks.router)
         self.client = AsyncClient(
-            transport=ASGITransport(app=self.app),
+            transport=ASGITransport(app=self.app, raise_app_exceptions=False),
             base_url="http://test",
         )
 
@@ -168,6 +175,67 @@ class TaskTypesApiTests(unittest.IsolatedAsyncioTestCase):
                     "admin_id": self.admin_id,
                     "role": "admin",
                 }
+
+    async def test_check_weight_completion_records_both_weights_in_alert(self):
+        created = await self._create({"task_type": "check_weight"})
+        self.actor = {
+            "id": self.eleveur_id,
+            "admin_id": self.admin_id,
+            "role": "eleveur",
+        }
+
+        response = await self.client.post(
+            f"/tasks/{created.json()['id']}/done",
+            json={
+                "previous_weight_kg": 400,
+                "completed_weight_kg": 407.5,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["previous_weight_kg"], 400)
+        self.assertEqual(response.json()["completed_weight_kg"], 407.5)
+        alert = next(iter(self.cols.alerts.documents.values()))
+        self.assertEqual(alert["previous_weight_kg"], 400)
+        self.assertEqual(alert["completed_weight_kg"], 407.5)
+        self.assertIn("Ancien poids : 400 kg → 407.5 kg.", alert["message"])
+        retry = await self.client.post(
+            f"/tasks/{created.json()['id']}/done",
+            json={
+                "previous_weight_kg": 400,
+                "completed_weight_kg": 407.5,
+            },
+        )
+        self.assertEqual(retry.status_code, 200)
+        self.assertEqual(len(self.cols.alerts.documents), 1)
+
+    async def test_retry_after_alert_insert_failure_creates_completion_alert(self):
+        created = await self._create({"task_type": "check_weight"})
+        self.actor = {
+            "id": self.eleveur_id,
+            "admin_id": self.admin_id,
+            "role": "eleveur",
+        }
+        self.cols.alerts.fail_next_insert = True
+        completion = {
+            "previous_weight_kg": 400,
+            "completed_weight_kg": 407.5,
+        }
+
+        first_attempt = await self.client.post(
+            f"/tasks/{created.json()['id']}/done",
+            json=completion,
+        )
+        retry = await self.client.post(
+            f"/tasks/{created.json()['id']}/done",
+            json=completion,
+        )
+
+        self.assertEqual(first_attempt.status_code, 500)
+        self.assertEqual(retry.status_code, 200)
+        self.assertEqual(len(self.cols.alerts.documents), 1)
+        alert = next(iter(self.cols.alerts.documents.values()))
+        self.assertIn("Ancien poids : 400 kg → 407.5 kg.", alert["message"])
 
 
 if __name__ == "__main__":

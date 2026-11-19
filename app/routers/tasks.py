@@ -123,6 +123,7 @@ class TaskCompletionIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     completed_weight_kg: float | None = Field(default=None, gt=0, le=1500)
+    previous_weight_kg: float | None = Field(default=None, gt=0, le=1500)
     completion_note: str | None = Field(default=None, max_length=1000)
 
     @field_validator("completion_note")
@@ -153,6 +154,7 @@ class TaskOut(BaseModel):
     completed_by_name: str | None = None
     completion_note: str | None = None
     completed_weight_kg: float | None = None
+    previous_weight_kg: float | None = None
 
 
 def _task_out(task: dict, names: dict[ObjectId, str]) -> dict:
@@ -177,6 +179,7 @@ def _task_out(task: dict, names: dict[ObjectId, str]) -> dict:
         completed_by_name=names.get(completed_by),
         completion_note=task.get("completion_note"),
         completed_weight_kg=task.get("completed_weight_kg"),
+        previous_weight_kg=task.get("previous_weight_kg"),
     ).model_dump(mode="json")
 
 
@@ -276,6 +279,7 @@ async def create_task(
         "completed_by": None,
         "completion_note": None,
         "completed_weight_kg": None,
+        "previous_weight_kg": None,
     }
     result = await cols.tasks.insert_one(task)
     task["_id"] = result.inserted_id
@@ -392,11 +396,11 @@ async def mark_task_done(
                 "completed_by": actor["id"],
                 "completion_note": body.completion_note,
                 "completed_weight_kg": body.completed_weight_kg,
+                "previous_weight_kg": body.previous_weight_kg,
             }
         },
         return_document=ReturnDocument.AFTER,
     )
-    newly_completed = task is not None
     if task is None:
         task = await cols.tasks.find_one(
             {
@@ -408,16 +412,30 @@ async def mark_task_done(
         )
     if task is None:
         raise HTTPException(404, "Task not found")
-    if newly_completed:
+
+    completion_alert = await cols.alerts.find_one(
+        {"task_id": task["_id"], "type": "task_completed"},
+        {"_id": 1},
+    )
+    if completion_alert is None:
         eleveur = await cols.eleveurs.find_one(
             {"_id": actor["id"], "admin_id": actor["admin_id"]},
             {"name": 1},
         )
-        weight_text = (
-            f" Poids relevé : {body.completed_weight_kg:g} kg."
-            if body.completed_weight_kg is not None
-            else ""
-        )
+        previous_weight = task.get("previous_weight_kg")
+        completed_weight = task.get("completed_weight_kg")
+        if (
+            previous_weight is not None
+            and completed_weight is not None
+        ):
+            weight_text = (
+                f" Ancien poids : {previous_weight:g} kg → "
+                f"{completed_weight:g} kg."
+            )
+        elif completed_weight is not None:
+            weight_text = f" Poids relevé : {completed_weight:g} kg."
+        else:
+            weight_text = ""
         await cols.alerts.insert_one(
             new_alert(
                 "system",
@@ -429,9 +447,11 @@ async def mark_task_done(
                 task["admin_id"],
                 actor["id"],
                 datetime.now(timezone.utc),
+                dedupe_key=f"task_completed:{task['_id']}",
                 task_id=task["_id"],
-                completion_note=body.completion_note,
-                completed_weight_kg=body.completed_weight_kg,
+                completion_note=task.get("completion_note"),
+                completed_weight_kg=completed_weight,
+                previous_weight_kg=previous_weight,
             )
         )
     return _task_out(task, {})
